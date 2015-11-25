@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import sys
+from collections import namedtuple
 from itertools import chain
 from importlib import import_module
 
@@ -27,7 +28,7 @@ def parse_args():
         '--info', metavar='SCENARIO',
         help='Explain in human-readable form events the scenario contains.')
     argparser.add_argument(
-        '--entry-point', '-m', metavar='MODULE_PATH',
+        '--main', '-m', metavar='MODULE_PATH',
         help='The application entry point (either a module to invoke as '
              '"__main__", or a path.to.main.function).')
     argparser.add_argument( # TODO
@@ -64,24 +65,38 @@ def parse_args():
         log.error(*args, **kwargs)
         sys.exit(1)
 
-    if args.record:
-        if not args.entry_point:
-            error('--entry-point ("module.path.to.main" function) '
-                  'required with --record: %s', e)
+    if args.record or args.replay:
+        if not args.main:
+            error('--record/--replay require --main ("module.path.to.main" function)')
 
-        def _run(entry_point=args.entry_point):
+        def _run(entry_point=args.main):
+            # Make the application believe it was run unpatched
+            sys.argv = [entry_point]
+
+            log.debug('Importing module %s ...', entry_point)
             try:
-                module, entry = entry_point.rsplit('.', 1)
-                module = import_module(module)
-                entry = getattr(module, entry)
+                module = import_module(entry_point)
+                # TODO: make the following two lines work
+                module.__name__ = '__main__'  # enter __name__ == '__main__'
+                log.info('Running %s', entry_point)
             except ImportError as e:
-                error("Can't import '%s'", module)
-            # If entry is not a module but a (main) function, do call it
-            if callable(entry):
-                entry()
+                # Entry point is not a module but a main function
+                try:
+                    module, entry = entry_point.rsplit('.', 1)
+                    log.debug('Failed. Importing module %s', module)
+                    module = import_module(module)
+                    log.info('Running %s', entry_point)
+                    entry = getattr(module, entry)
+                except (ValueError, ImportError) as e:
+                    error("Can't import '%s': %s", module, e)
+                # If entry is not a module but a (main) function, do call it
+                if callable(entry):
+                    entry()
+                else:
+                    error('%s is not a function', entry_point)
 
-        args.entry_point = _run
-
+        args.main = _run
+    if args.record:
         try: args.record = open(args.record, 'wb')
         except Exception as e:
             error('--record: %s', e)
@@ -96,7 +111,24 @@ def parse_args():
     return args
 
 
+# class PathElement(namedtuple):
+#     """Element in """
+#     def __new__(cls, *args):
+#         super().__new__('PathElement', ('index', 'type', 'name'))
+#     def __init__(self, index, type, name):
+#         self.index = index
+#         self.type = type
+#         self.name = name
+#
+#     def __repr__(self):
+#         return '(' + ', '.join((self.index, self.type, self.name)) + ')'
+
+PathElement = namedtuple('PathElement', ('index', 'type', 'name'))
+
+
 class Resolver:
+    FUZZY_MATCHING = False
+
     @staticmethod
     def _qenum_key(base, value, klass=None):
         """Return Qt enum value as string name of its key.
@@ -190,7 +222,7 @@ class Resolver:
         return '|'.join(filter(None, keys))
 
     @classmethod
-    def _serialize(cls, value, attr):
+    def _serialize_value(cls, value, attr):
         """Return str representation of value for attribute attr."""
         value_type = type(value)
         if value_type == int:
@@ -212,7 +244,7 @@ class Resolver:
             s = cls._qenum_key(Qt, value)
             if s: return s
         # Finally, if it ends with 's', it's probably a QFlags object
-        # combining the flags of associates Qt.<name-without-s> type, e.g.
+        # combining the flags of associated Qt.<name-without-s> type, e.g.
         # bitwise or-ing Qt.MouseButton values (Qt.LeftButton | Qt.RightButton)
         # makes a Qt.MouseButtons object:
         assert isinstance((Qt.LeftButton | Qt.RightButton), Qt.MouseButtons)
@@ -239,12 +271,11 @@ class Resolver:
                         event_type, event.type(), event_type.__mro__)
 
         args = [event_type.__name__]
-        args.append(str(event.spontaneous()))
         args.append(cls._qenum_key(QtCore.QEvent, event.type()))
 
         for attr in event_attributes:
             value = getattr(event, attr)()
-            try: args.append(cls._serialize(value, attr))
+            try: args.append(cls._serialize_value(value, attr))
             except ValueError:
                 log.warning("Can't serialize object {} of type {} "
                             "for attribute {}".format(value,
@@ -264,59 +295,126 @@ class Resolver:
         return tuple(args)
 
     @staticmethod
-    def deserialize_event(serialized_event):
-        ...
-    @staticmethod
-    def serialize_object(obj) -> str:
+    def deserialize_event(event):
+        if event[0] == 'QEvent':
+            assert len(event) == 2
+            event = QtCore.QEvent(eval('QtCore.' + event[1]))
+            return event
+        event = eval('QtGui.' + event[0] + '(' + ', '.join(event[1:]) + ')')
+        return event
+
+    @classmethod
+    def serialize_object(cls, obj):
         assert any('QObject' == cls.__name__
-                   for cls in obj.__class__.__mro__), (obj, obj.__class__.__mro__)
+                   for cls in type(obj).mro()), (obj, type(obj).mro())
+
         def _canonical_path(obj):
-            yield obj
-            obj = obj.parent()
-            while obj is not None:
-                yield obj
-                obj = obj.parent()
-        path = '/'.join(reversed([type(obj).__name__ + '(' + obj.objectName() + ')'
-                                  for obj in _canonical_path(obj)]))
+
+            def _index_by_type(lst, obj):
+                return [i for i in lst if type(i) == type(obj)].index(obj)
+
+            parent = obj.parent()
+            while parent is not None:
+                yield obj, _index_by_type(parent.children(), obj)
+                obj = parent
+                parent = parent.parent()
+            yield obj, _index_by_type(QtGui.qApp.topLevelWidgets(), obj)
+
+        # path = '/'.join(reversed(['[{}]{}({})'.format(index_by_type,
+        #                                               type(obj).__name__,
+        #                                               obj.objectName())
+        #                           for obj, index_by_type in _canonical_path(obj)]))
+        path = tuple(reversed([PathElement(index_by_type, type(obj), obj.objectName())
+                               for obj, index_by_type in _canonical_path(obj)]))
         log.debug('Serialized object path: %s', path)
         return path
-    @staticmethod
-    def deserialize_object(runtime, obj_path):
-        prefix_path, obj_type, obj_name = obj_path
-        obj = runtime.app.findChild(obj_type, obj_name)
-        ...
-        return obj
+
+    @classmethod
+    def deserialize_object(cls, qApp, path):
+        target = path[-1]
+        # Find target object by name
+        if target.name:
+            obj = qApp.findChild(target.type, target.name)
+            if obj:
+                return obj
+
+        # If target doesn't have a name, find the object in the tree
+        # FIXME: The logic here may need rework
+
+        def filtertype(target_type, iterable):
+            return [i for i in iterable if type(i) == target_type]
+
+        def get_candidates(widget, i):
+            if not (type(widget) == path[i].type and
+                    (not path[i].name or path[i].name == widget.objectName())):
+                return
+
+            if i == len(path) - 1:
+                return widget
+
+            # If fuzzy matching, all the children widgets are considered;
+            # otherwise just the one in the correct position
+            children = widget.children()
+            if not cls.FUZZY_MATCHING:
+                target = path[i + 1]
+                try:
+                    children = (filtertype(target.type, children)[target.index],)
+                except IndexError:
+                    # Insufficient children of correct type
+                    return
+
+            for child in children:
+                obj = get_candidates(child, i + 1)
+                if obj:
+                    return obj
+
+        target = path[0]
+        widgets = qApp.topLevelWidgets()
+        if not cls.FUZZY_MATCHING:
+            try:
+                widgets = (filtertype(target.type, widgets)[target.index],)
+            except IndexError:
+                return
+        for window in widgets:
+            obj = get_candidates(window, 0)
+            if obj:
+                return obj
+
+        # No suitable object found
+        return None
 
     @classmethod
     def getstate(cls, obj, event):
         """Return picklable state of the object and its event"""
         return (cls.serialize_object(obj),
                 cls.serialize_event(event))
+
     @classmethod
-    def setstate(cls, runtime, obj, event):
-        return runtime.app.postEvent(cls.deserialize_object(obj),
-                                     cls.deserialize_event(event))
+    def setstate(cls, qApp, obj, event):
+        return qApp.sendEvent(cls.deserialize_object(qApp, obj),
+                              cls.deserialize_event(event))
 
 
-def EventRecorder_factory(*args, **kwargs):
+def EventRecorder():
     """
     Return an instance of EventRecorder with closure over correct
-    (PyQt4's or PyQt5's) version of QtCore module.
+    (PyQt4's or PyQt5's) version of QtCore.QObject.
     """
     global QtCore
 
     class EventRecorder(QtCore.QObject):
 
-        RECORD_EVENTS = {
-            QtCore.QEvent.Close,
-            QtCore.QEvent.ContextMenu,
+        QEVENT_EVENTS = {
+            # Events that extend QEvent
+            # QtCore.QEvent.Close,
+            # QtCore.QEvent.ContextMenu,
             QtCore.QEvent.DragEnter,
             QtCore.QEvent.DragLeave,
             QtCore.QEvent.DragMove,
             QtCore.QEvent.Drop,
             QtCore.QEvent.Enter,
-            QtCore.QEvent.FocusIn,
-            QtCore.QEvent.FocusOut,
+            # QtCore.QEvent.FocusIn,
+            # QtCore.QEvent.FocusOut,
             QtCore.QEvent.KeyPress,
             QtCore.QEvent.KeyRelease,
             QtCore.QEvent.MouseButtonDblClick,
@@ -324,14 +422,15 @@ def EventRecorder_factory(*args, **kwargs):
             QtCore.QEvent.MouseButtonRelease,
             QtCore.QEvent.MouseMove,
             QtCore.QEvent.Move,
-            QtCore.QEvent.Resize,
+            # QtCore.QEvent.Resize,
             # TODO: add non-spontaneous QtCore.QStateMachine.SignalEvent ?
         }
+
         EventType = {v: k
                      for k, v in QtCore.QEvent.__dict__.items()
                      if isinstance(v, int)}
 
-        def __init__(self, args):
+        def __init__(self):
             super().__init__()
             self.log = []
 
@@ -339,22 +438,71 @@ def EventRecorder_factory(*args, **kwargs):
             # Only process out-of-application, system (e.g. X11) events
             if not event.spontaneous():
                 return False
-            is_skipped = event.type() not in self.RECORD_EVENTS
-            log.debug('Caught %s %s event',
+            is_skipped = event.type() not in self.QEVENT_EVENTS
+            log.debug('Caught %s%s %s event: %s',
+                      'spontaneous ' if event.spontaneous() else '',
                       'skipped' if is_skipped else 'recorded',
-                      self.EventType[event.type()])
+                      self.EventType[event.type()],
+                      type(event))
             if not is_skipped:
                 self.log.append(Resolver.getstate(obj, event))
             return False
 
         def dump(self, file):
+            log.debug('Writing scenario file')
             try:
                 import cPickle as pickle
             except ImportError:
                 import pickle
             pickle.dump(self.log, file, protocol=0)
+            log.info("Scenario written into '%s'", file.name)
 
-    return EventRecorder(*args, **kwargs)
+    return EventRecorder()
+
+
+def EventReplayer():
+    """
+    Return an instance of EventReplayer with closure over correct
+    (PyQt4's or PyQt5's) version of QtCore.QObject.
+    """
+    global QtCore
+
+    class EventReplayer(QtCore.QObject):
+
+        started = False
+
+        def __init__(self):
+            super().__init__()
+            self.state
+
+        def eventFilter(self, obj, event):
+            if event.type() == QtCore.Qt.ActivationChange:
+                self.started = True
+                QtCore.QTimer()
+
+            # Only process out-of-application, system (e.g. X11) events
+            if not event.spontaneous():
+                return False
+            is_skipped = event.type() not in self.QEVENT_EVENTS
+            log.debug('Caught %s%s %s event: %s',
+                      'spontaneous ' if event.spontaneous() else '',
+                      'skipped' if is_skipped else 'recorded',
+                      self.EventType[event.type()],
+                      type(event))
+            if not is_skipped:
+                self.log.append(Resolver.getstate(obj, event))
+            return False
+
+        def dump(self, file):
+            log.debug('Writing scenario file')
+            try:
+                import cPickle as pickle
+            except ImportError:
+                import pickle
+            pickle.dump(self.log, file, protocol=0)
+            log.info("Scenario written into '%s'", file.name)
+
+    return EventReplayer()
 
 
 def main():
@@ -368,37 +516,38 @@ def main():
     QT_KEYS = {value: 'Qt.' + key
                for key, value in Qt.__dict__.items()
                if key.startswith('Key_')}
+    Resolver.FUZZY_MATCHING = args.fuzzy
 
     assert 'Qt.LeftButton|Qt.RightButton' == \
-        Resolver._qflags_key(Qt, Qt.LeftButton|Qt.RightButton)
+           Resolver._qflags_key(Qt, Qt.LeftButton|Qt.RightButton)
 
+    event_filters = []
+    recorder = None
     if args.record:
-        event_filter = EventRecorder_factory(args)
+        recorder = EventRecorder()
+        event_filters.append(recorder)
+    if args.replay:
+        event_filters.append(EventReplayer())
+    ...
 
-        class QApplication(QtGui.QApplication):
-            def __init__(self, *args, **kwargs):
-                super().__init__(*args, **kwargs)
+    assert event_filters
+
+    class QApplication(QtGui.QApplication):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            for event_filter in event_filters:
                 self.installEventFilter(event_filter)
 
-        # Patch QApplication to filter all events through EventRecorder
-        QtGui.QApplication = QApplication
+    # Patch QApplication to filter all events through EventRecorder
+    QtGui.QApplication = QApplication
 
-        # Execute the app
-        log.info('Running {}.{}'.format(args.entry_point.__module__,
-                                        args.entry_point.__name__))
-        args.entry_point()
-        # TODO: catch kill signals and propagate them to app
+    # Execute the app
+    args.main()
+    # TODO: catch kill signals and propagate them to app
 
-        # Write the "logs"
-        event_filter.dump(args.record)
-
-
-
-
-
-    elif args.replay:
-        pass
-    else: pass
+    # Write the "logs"
+    if args.record:
+        recorder.dump(args.record)
 
     return 0
 
