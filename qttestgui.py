@@ -5,6 +5,12 @@ from collections import namedtuple
 from itertools import chain
 from importlib import import_module
 
+# Allow termination with Ctrl+C
+import signal; signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+
+REAL_EXIT = sys.exit
+
 
 def parse_args():
     from argparse import ArgumentParser
@@ -28,6 +34,9 @@ def parse_args():
         '--info', metavar='SCENARIO',
         help='Explain in human-readable form events the scenario contains.')
     argparser.add_argument(
+        '--plugin', '-p', metavar='MODULE_PATH',
+        help='The plugin to counsel with when recording/replaying events')
+    argparser.add_argument(
         '--main', '-m', metavar='MODULE_PATH',
         help='The application entry point (either a module to invoke as '
              '"__main__", or a path.to.main.function).')
@@ -40,9 +49,10 @@ def parse_args():
     argparser.add_argument( # TODO
         '--fuzzy', action='store_true',
         help='Fuzzy-matching of event target objects.')
-    argparser.add_argument( # TODO
+    argparser.add_argument(
         '--x11', action='store_true',
-        help='When replaying scenarios, do it in a new, headless X11 server.')
+        help=('When replaying scenarios, do it in a new, headless X11 server. '
+              "This makes your app's stdout piped to stderr."))
     argparser.add_argument( # TODO
         '--coverage', action='store_true',
         help='Run the coverage analysis simultaneously.')
@@ -60,14 +70,17 @@ def parse_args():
             log.setLevel(logging.DEBUG)
 
     init_logging(args.verbose)
+    log.debug('Program arguments: %s', args)
 
     def error(*args, **kwargs):
         log.error(*args, **kwargs)
-        sys.exit(1)
+        REAL_EXIT(1)
 
+    if args.plugin:
+        ... # TODO
     if args.record or args.replay:
         if not args.main:
-            error('--record/--replay require --main ("module.path.to.main" function)')
+            error('--record/--replay requires --main ("module.path.to.main" function)')
 
         def _run(entry_point=args.main):
             # Make the application believe it was run unpatched
@@ -79,8 +92,12 @@ def parse_args():
                 # TODO: make the following two lines work
                 module.__name__ = '__main__'  # enter __name__ == '__main__'
                 log.info('Running %s', entry_point)
+                is_imported = True
             except ImportError as e:
-                # Entry point is not a module but a main function
+                is_imported = False
+
+            # Entry point is not a module but a main function
+            if not is_imported:
                 try:
                     module, entry = entry_point.rsplit('.', 1)
                     log.debug('Failed. Importing module %s', module)
@@ -90,10 +107,9 @@ def parse_args():
                 except (ValueError, ImportError) as e:
                     error("Can't import '%s': %s", module, e)
                 # If entry is not a module but a (main) function, do call it
-                if callable(entry):
-                    entry()
-                else:
+                if not callable(entry):
                     error('%s is not a function', entry_point)
+                entry()
 
         args.main = _run
     if args.record:
@@ -108,6 +124,28 @@ def parse_args():
         # TODO: https://coverage.readthedocs.org/en/coverage-4.0.2/api.html#api
         #       https://nose.readthedocs.org/en/latest/plugins/cover.html#source
         ...
+
+    if args.x11:
+        if not args.replay:
+            error('--x11 requires --replay')
+        # Escalate the power of shell
+        import subprocess
+        try:
+            if 0 != subprocess.call(['xvfb-run', '--help'],
+                                    stdout=subprocess.DEVNULL):
+                raise OSError
+        except OSError:
+            error('Headless X11 (--x11) requires working xvfb-run. Install package xvfb.')
+        log.info('Re-running head-less in Xvfb. '
+                 # The following cannot be avoided because Xvfb writes all app's
+                 # output, including stderr, to stdout
+                 'All subprocess output (including stdout) will be piped to stderr')
+        sys.argv.remove('--x11')  # Prevent recursion
+        subprocess.call(['xvfb-run'] + sys.argv,
+                                  stdout=sys.stderr)
+        REAL_EXIT(13)
+        # REAL_EXIT(subprocess.call(['xvfb-run'] + sys.argv,
+        #                           stdout=sys.stderr))
     return args
 
 
@@ -231,13 +269,22 @@ class Resolver:
                 return QT_KEYS[value]
             return str(value)
         if value_type == str:
-            return value
+            return repr(value)
         if value_type == bool:
             return str(value)
+        # QPoint/QRect (...) values are pickleable directly according to PyQt
+        # docs. The reason they are not used like this here is consistency and
+        # smaller size. Yes, this string is >100% more light-weight.
         if isinstance(value, (QtCore.QPointF, QtCore.QPoint)):
-            return ...
+            return 'QtCore.{}({}, {})'.format(value.__class__.__name__,
+                                              value.x(),
+                                              value.y())
         if isinstance(value, (QtCore.QRectF, QtCore.QRect)):
-            return ...
+            return 'QtCore.{}({}, {})'.format(value.__class__.__name__,
+                                              value.x(),
+                                              value.y(),
+                                              value.width(),
+                                              value.height())
         # Perhaps it's an enum value from Qt namespace
         assert isinstance(Qt.LeftButton, int)
         if isinstance(value, int):
@@ -250,14 +297,16 @@ class Resolver:
         assert isinstance((Qt.LeftButton | Qt.RightButton), Qt.MouseButtons)
         if value.__class__.__name__.endswith('s'):
             s = cls._qflags_key(Qt, value)
-            if s: return s
+            if s:
+                return s
 
         raise ValueError
 
     EVENT_ATTRIBUTES = {
         # Q*Event attributes, ordered as the constructor takes them
-        'QMouseEvent':'pos globalPos button buttons modifiers'.split(),
-        'QKeyEvent': 'key modifiers text isAutoRepeat count'.split(),
+        'QMouseEvent':'type pos globalPos button buttons modifiers'.split(),
+        'QKeyEvent': 'type key modifiers text isAutoRepeat count'.split(),
+        'QMoveEvent': 'pos oldPos'.split(),
     }
 
     @classmethod
@@ -265,14 +314,16 @@ class Resolver:
         assert any('QEvent' == cls.__name__
                    for cls in event.__class__.__mro__), (event, event.__class__.__mro__)
         event_type = type(event)
-        event_attributes = cls.EVENT_ATTRIBUTES.get(event_type.__name__, ())
+        event_attributes = cls.EVENT_ATTRIBUTES.get(event_type.__name__, ('type',))
         if not event_attributes:
             log.warning('Unknown event: %s, type=%s, mro=%s',
                         event_type, event.type(), event_type.__mro__)
 
         args = [event_type.__name__]
-        args.append(cls._qenum_key(QtCore.QEvent, event.type()))
-
+        if event_attributes and event_attributes[0] == 'type':
+            args.append('QtCore.' + cls._qenum_key(QtCore.QEvent, event.type()))
+            # Skip first element (type) in the loop ahead
+            event_attributes = iter(event_attributes); next(event_attributes)
         for attr in event_attributes:
             value = getattr(event, attr)()
             try: args.append(cls._serialize_value(value, attr))
@@ -296,9 +347,9 @@ class Resolver:
 
     @staticmethod
     def deserialize_event(event):
-        if event[0] == 'QEvent':
+        if event[0] == 'QEvent':   # Generic, unspecialized QEvent
             assert len(event) == 2
-            event = QtCore.QEvent(eval('QtCore.' + event[1]))
+            event = QtCore.QEvent(eval(event[1]))
             return event
         event = eval('QtGui.' + event[0] + '(' + ', '.join(event[1:]) + ')')
         return event
@@ -390,9 +441,14 @@ class Resolver:
                 cls.serialize_event(event))
 
     @classmethod
-    def setstate(cls, qApp, obj, event):
-        return qApp.sendEvent(cls.deserialize_object(qApp, obj),
-                              cls.deserialize_event(event))
+    def setstate(cls, qApp, obj_path, event_str):
+        obj = cls.deserialize_object(qApp, obj_path)
+        if obj is None:
+            log.error("Can't replay event %s on object %s: Object not found",
+                      event_str, obj_path)
+            REAL_EXIT(3)
+        event = cls.deserialize_event(event_str)
+        return qApp.sendEvent(obj, event)
 
 
 def EventRecorder():
@@ -424,37 +480,36 @@ def EventRecorder():
             QtCore.QEvent.Move,
             # QtCore.QEvent.Resize,
             # TODO: add non-spontaneous QtCore.QStateMachine.SignalEvent ?
+            QtCore.QStateMachine.SignalEvent,
         }
-
-        EventType = {v: k
-                     for k, v in QtCore.QEvent.__dict__.items()
-                     if isinstance(v, int)}
 
         def __init__(self):
             super().__init__()
-            self.log = []
+            self.events = []
 
         def eventFilter(self, obj, event):
             # Only process out-of-application, system (e.g. X11) events
-            if not event.spontaneous():
-                return False
+            # if not event.spontaneous():
+            #     return False
+            if isinstance(event, QtCore.QStateMachine.SignalEvent):
+                log.warning('Got signal event!')
+            if event.type() == QtCore.QEvent.StateMachineSignal:
+                log.warning('Got signal event!')
             is_skipped = event.type() not in self.QEVENT_EVENTS
             log.debug('Caught %s%s %s event: %s',
                       'spontaneous ' if event.spontaneous() else '',
                       'skipped' if is_skipped else 'recorded',
-                      self.EventType[event.type()],
+                      EVENT_TYPE.get(event.type(), 'Unknown(type=' + str(event.type()) + ')'),
                       type(event))
             if not is_skipped:
-                self.log.append(Resolver.getstate(obj, event))
+                self.events.append(Resolver.getstate(obj, event))
             return False
 
         def dump(self, file):
             log.debug('Writing scenario file')
-            try:
-                import cPickle as pickle
-            except ImportError:
-                import pickle
-            pickle.dump(self.log, file, protocol=0)
+            try: import cPickle as pickle
+            except ImportError: import pickle
+            pickle.dump(self.events, file, protocol=0)
             log.info("Scenario written into '%s'", file.name)
 
     return EventRecorder()
@@ -463,44 +518,63 @@ def EventRecorder():
 def EventReplayer():
     """
     Return an instance of EventReplayer with closure over correct
-    (PyQt4's or PyQt5's) version of QtCore.QObject.
+    (PyQt4's or PyQt5's) version of QtCore.
     """
-    global QtCore
+    global QtCore, QtGui
 
     class EventReplayer(QtCore.QObject):
 
         started = False
+        i = 0
+        exitSuccessful = QtCore.pyqtSignal()
 
         def __init__(self):
             super().__init__()
-            self.state
+            self.timer = timer = QtCore.QTimer(self)
+            # Replay events X ms after the last event
+            timer.setInterval(100)
+            timer.timeout.connect(self.replay_next_event)
+
+        def load(self, file):
+            try: import cPickle as pickle
+            except ImportError: import pickle
+            self.events = iter(pickle.load(file))
 
         def eventFilter(self, obj, event):
-            if event.type() == QtCore.Qt.ActivationChange:
-                self.started = True
-                QtCore.QTimer()
-
-            # Only process out-of-application, system (e.g. X11) events
-            if not event.spontaneous():
+            if not self.started:
+                log.debug(
+                    'Caught %s (%s) event but app not yet fully "started"',
+                    EVENT_TYPE.get(event.type(), 'Unknown(type=' + str(event.type()) + ')'),
+                    type(event).__name__)
+                if event.type() == QtCore.QEvent.ActivationChange:
+                    log.debug("Ok, app is started now, don't worry")
+                    self.started = True
+                # With the following return uncommented, Xvfb doesn't seem to
+                # exit on testapp errors ???
+                # FIXME: I think the return should be here.
+                # return False
+            if (event.type() == QtCore.QEvent.Timer and
+                    event.timerId() == self.timer.timerId()):
+                # Skip self's timer events
                 return False
-            is_skipped = event.type() not in self.QEVENT_EVENTS
-            log.debug('Caught %s%s %s event: %s',
-                      'spontaneous ' if event.spontaneous() else '',
-                      'skipped' if is_skipped else 'recorded',
-                      self.EventType[event.type()],
+            log.debug('Caught %s (%s) event; resetting timer',
+                      EVENT_TYPE.get(event.type(), 'Unknown(type=' + str(event.type()) + ')'),
                       type(event))
-            if not is_skipped:
-                self.log.append(Resolver.getstate(obj, event))
+            self.timer.stop()
+            self.timer.start()
             return False
 
-        def dump(self, file):
-            log.debug('Writing scenario file')
-            try:
-                import cPickle as pickle
-            except ImportError:
-                import pickle
-            pickle.dump(self.log, file, protocol=0)
-            log.info("Scenario written into '%s'", file.name)
+        @QtCore.pyqtSlot()
+        def replay_next_event(self):
+            self.timer.stop()
+            event = next(self.events, None)
+            if not event:
+                log.info('No more events to replay.')
+                QtGui.qApp.quit()
+                return
+            log.debug('Replaying event: %s', event)
+            Resolver.setstate(QtGui.qApp, *event)
+            return False
 
     return EventReplayer()
 
@@ -508,7 +582,8 @@ def EventReplayer():
 def main():
     args = parse_args()
 
-    global QtGui, QtCore, Qt, QT_KEYS
+    # Set some global variables
+    global QtGui, QtCore, Qt, QT_KEYS, EVENT_TYPE
     PyQt = 'PyQt' + str(args.qt)
     QtGui = import_module(PyQt + '.QtGui')
     QtCore = import_module(PyQt + '.QtCore')
@@ -516,40 +591,63 @@ def main():
     QT_KEYS = {value: 'Qt.' + key
                for key, value in Qt.__dict__.items()
                if key.startswith('Key_')}
+    EVENT_TYPE = {v: k
+                  for k, v in QtCore.QEvent.__dict__.items()
+                  if isinstance(v, int)}
     Resolver.FUZZY_MATCHING = args.fuzzy
 
+    # This is just a simple unit test. Put here because real Qt has only
+    # been made available above.
     assert 'Qt.LeftButton|Qt.RightButton' == \
            Resolver._qflags_key(Qt, Qt.LeftButton|Qt.RightButton)
 
     event_filters = []
-    recorder = None
     if args.record:
         recorder = EventRecorder()
         event_filters.append(recorder)
     if args.replay:
-        event_filters.append(EventReplayer())
+        replayer = EventReplayer()
+        replayer.load(args.replay)
+        event_filters.append(replayer)
     ...
 
     assert event_filters
 
+    # Patch QApplication to filter all events through EventRecorder / EventReplayer
     class QApplication(QtGui.QApplication):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             for event_filter in event_filters:
+                log.debug('Installing event filter: %s',
+                          type(event_filter).__name__)
                 self.installEventFilter(event_filter)
-
-    # Patch QApplication to filter all events through EventRecorder
     QtGui.QApplication = QApplication
+
+    # Prevent exit with zero status from inside the app. We need to exit from this app.
+    def exit(status=0):
+        log.warning('Prevented call to sys.exit() with status: %s', str(status))
+        if status != 0:
+            REAL_EXIT(status)
+    sys.exit = exit
+
+    # Qt doesn't raise exceptions out of its event loop; but this works
+    def excepthook(type, value, tback):
+        import traceback
+        log.error('Unhandled exception encountered')
+        traceback.print_exception(type, value, tback)
+        REAL_EXIT(2)
+    sys.excepthook = excepthook
 
     # Execute the app
     args.main()
-    # TODO: catch kill signals and propagate them to app
 
-    # Write the "logs"
+    log.info('Application exited successfully. Congrats!')
+
+    # Write out the scenario
     if args.record:
         recorder.dump(args.record)
 
     return 0
 
 if __name__ == '__main__':
-    sys.exit(main())
+    REAL_EXIT(main())
