@@ -31,25 +31,28 @@ def parse_args():
         '--record', metavar='SCENARIO',
         help='Record the events the user sends to the entry-point application '
              'into the scenario file.')
-    group.add_argument( # TODO
+    group.add_argument(
         '--replay', metavar='SCENARIO',
         help='Replay the scenario.')
     group.add_argument( # TODO
         '--info', metavar='SCENARIO',
         help='Explain in human-readable form events the scenario contains.')
     argparser.add_argument(
-        '--plugin', '-p', metavar='MODULE_PATH',
-        help='The plugin to counsel with when recording/replaying events')
-    argparser.add_argument(
         '--main', '-m', metavar='MODULE_PATH',
         help='The application entry point (either a module to invoke as '
              '"__main__", or a path.to.main.function).')
     argparser.add_argument( # TODO
-        '--filter-include', metavar='FILTERS',
+        '--events-include', metavar='FILTER',
         help='When recording, record only events that match the filter.')
     argparser.add_argument( # TODO
-        '--filter-exclude', metavar='FILTERS',
-        help="When recording, don't record events that match the filter.")
+        '--events-exclude', metavar='FILTER',
+        help="When recording, skip events that match the filter.")
+    argparser.add_argument( # TODO
+        '--objects-include', metavar='FILTER',
+        help='When recording, record only events on objects that match the filter.')
+    argparser.add_argument( # TODO
+        '--objects-exclude', metavar='FILTER',
+        help="When recording, skip events on objects that match the filter.")
     argparser.add_argument(
         '--fuzzy', action='store_true',
         help='Fuzzy-matching of event target objects.')
@@ -57,8 +60,8 @@ def parse_args():
         '--x11', action='store_true',
         help=('When replaying scenarios, do it in a new, headless X11 server. '
               "This makes your app's stdout piped to stderr. "
-              "It will work better (or at all) if you make one of the following '"
-              "window managers available: " + ', '.join(WINDOW_MANAGERS)))
+              "It will work better (or at all) if you make one of the following "
+              "window managers available: " + ', '.join(WINDOW_MANAGERS)) + '.')
     argparser.add_argument( # TODO
         '--coverage', action='store_true',
         help='Run the coverage analysis simultaneously.')
@@ -82,8 +85,6 @@ def parse_args():
         log.error(*args, **kwargs)
         REAL_EXIT(1)
 
-    if args.plugin:
-        ... # TODO
     if args.record or args.replay:
         if not args.main:
             error('--record/--replay requires --main ("module.path.to.main" function)')
@@ -156,23 +157,11 @@ def parse_args():
              'sh', '-c',
              # Try to spawn a lightweight window manager
              ' '.join('{} 2>/dev/null &'.format(wm) for wm in WINDOW_MANAGERS) +
+             ' sleep .5 ; ' +
              ' '.join(sys.argv)],
-             # ] + sys.argv,
             stdout=sys.stderr))
     return args
 
-
-# class PathElement(namedtuple):
-#     """Element in """
-#     def __new__(cls, *args):
-#         super().__new__('PathElement', ('index', 'type', 'name'))
-#     def __init__(self, index, type, name):
-#         self.index = index
-#         self.type = type
-#         self.name = name
-#
-#     def __repr__(self):
-#         return '(' + ', '.join((self.index, self.type, self.name)) + ')'
 
 PathElement = namedtuple('PathElement', ('index', 'type', 'name'))
 
@@ -345,16 +334,6 @@ class Resolver:
                             "for attribute {}".format(value,
                                                       value.__class__.__mro__,
                                                       attr))
-            # PROBLEM
-            # TODO: this is a problem. Qt requires that types of arguments to
-            # its constructors match strictly, i.e. QMouseEvent doesn't accept
-            # 0x2000000 (an int) as modifiers, but accepts Qt.ShiftModifier.
-            # This will be the most pain.
-
-            # Possible workarounds:
-            # * Qt.MouseButton.__instancecheck__(Qt.LeftButton) -> True
-            # * Named enums picklable (http://pyqt.sourceforge.net/Docs/PyQt5/pickle.html)
-            #   But not (LeftButton | RightButton, which is QtCore.MouseButtons which doesn't resolve
         log.debug('Serialized event: %s', args)
         return tuple(args)
 
@@ -377,6 +356,8 @@ class Resolver:
             def _index_by_type(lst, obj):
                 return [i for i in lst if type(i) == type(obj)].index(obj)
 
+            if not obj.parent():
+                pass
             parent = obj.parent()
             while parent is not None:
                 yield obj, _index_by_type(parent.children(), obj)
@@ -492,8 +473,7 @@ def EventRecorder():
             QtCore.QEvent.MouseMove,
             QtCore.QEvent.Move,
             # QtCore.QEvent.Resize,
-            # TODO: add non-spontaneous QtCore.QStateMachine.SignalEvent ?
-            QtCore.QStateMachine.SignalEvent,
+            QtCore.QStateMachine.SignalEvent,  # This doesn't work, forget about it
         }
 
         def __init__(self):
