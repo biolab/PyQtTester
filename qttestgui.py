@@ -13,6 +13,10 @@ REAL_EXIT = sys.exit
 
 
 def parse_args():
+    # WM must be compatible (probably click-to-focus, ...
+    # — I don't know, but most WMs I tried didn't work)
+    WINDOW_MANAGERS = ('windowlab',)
+
     from argparse import ArgumentParser
     argparser = ArgumentParser()
     argparser.add_argument(
@@ -46,13 +50,15 @@ def parse_args():
     argparser.add_argument( # TODO
         '--filter-exclude', metavar='FILTERS',
         help="When recording, don't record events that match the filter.")
-    argparser.add_argument( # TODO
+    argparser.add_argument(
         '--fuzzy', action='store_true',
         help='Fuzzy-matching of event target objects.')
     argparser.add_argument(
         '--x11', action='store_true',
         help=('When replaying scenarios, do it in a new, headless X11 server. '
-              "This makes your app's stdout piped to stderr."))
+              "This makes your app's stdout piped to stderr. "
+              "It will work better (or at all) if you make one of the following '"
+              "window managers available: " + ', '.join(WINDOW_MANAGERS)))
     argparser.add_argument( # TODO
         '--coverage', action='store_true',
         help='Run the coverage analysis simultaneously.')
@@ -139,13 +145,20 @@ def parse_args():
         log.info('Re-running head-less in Xvfb. '
                  # The following cannot be avoided because Xvfb writes all app's
                  # output, including stderr, to stdout
-                 'All subprocess output (including stdout) will be piped to stderr')
+                 'All subprocess output (including stdout) will be piped to stderr.')
         sys.argv.remove('--x11')  # Prevent recursion
-        subprocess.call(['xvfb-run'] + sys.argv,
-                                  stdout=sys.stderr)
-        REAL_EXIT(13)
-        # REAL_EXIT(subprocess.call(['xvfb-run'] + sys.argv,
-        #                           stdout=sys.stderr))
+        from os import path
+        REAL_EXIT(subprocess.call(
+            ['xvfb-run',
+             '--server-args', '-fbdir /tmp -screen 0 1280x1024x16',
+             '--auth-file', path.join(path.expanduser('~'), '.Xauthority'),
+             # Run in a new shell because multiple commands
+             'sh', '-c',
+             # Try to spawn a lightweight window manager
+             ' '.join('{} 2>/dev/null &'.format(wm) for wm in WINDOW_MANAGERS) +
+             ' '.join(sys.argv)],
+             # ] + sys.argv,
+            stdout=sys.stderr))
     return args
 
 
@@ -549,10 +562,12 @@ def EventReplayer():
                 if event.type() == QtCore.QEvent.ActivationChange:
                     log.debug("Ok, app is started now, don't worry")
                     self.started = True
-                # With the following return uncommented, Xvfb doesn't seem to
-                # exit on testapp errors ???
-                # FIXME: I think the return should be here.
-                # return False
+                # With the following return in place, Xvfb sometimes got stuck
+                # before any serious events happened. I suspected WM (or lack
+                # thereof) being the culprit, so now we spawn a WM that sends
+                # focus, activation events, ... This seems to have fixed it once.
+                # I think this return should be here.
+                return False
             if (event.type() == QtCore.QEvent.Timer and
                     event.timerId() == self.timer.timerId()):
                 # Skip self's timer events
