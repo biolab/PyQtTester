@@ -28,6 +28,11 @@ except ImportError:  # Py2
 SCENARIO_VERSION = 1
 
 
+def deepgetattr(obj, attr):
+    """Recurses through an attribute chain to get the ultimate value."""
+    return reduce(getattr, attr.split('.'), obj)
+
+
 def parse_args():
     # WM must be compatible (probably click-to-focus, ...
     # — I don't know, but most WMs I tried didn't work)
@@ -55,8 +60,7 @@ def parse_args():
         help='Explain in human-readable form events the scenario contains.')
     argparser.add_argument(
         '--main', '-m', metavar='MODULE_PATH',
-        help='The application entry point (either a module to invoke as '
-             '"__main__", or a path.to.main.function).')
+        help='The application entry point (module.path.to:main function).')
     argparser.add_argument( # TODO
         '--events-include', metavar='FILTER',
         help='When recording, record only events that match the filter.')
@@ -105,36 +109,23 @@ def parse_args():
         if not args.main:
             error('--record/--replay requires --main ("module.path.to.main" function)')
 
-        def _run(entry_point=args.main):
+        def _main(entry_point=args.main):
             # Make the application believe it was run unpatched
-            sys.argv = [entry_point]
-
-            log.debug('Importing module %s ...', entry_point)
+            sys.argv = [entry_point]  # TODO is this ok??
             try:
-                module = import_module(entry_point)
-                # TODO: make the following two lines work
-                module.__name__ = '__main__'  # enter __name__ == '__main__'
+                module, main = entry_point.split(':')
+                log.debug('Importing module %s ...', module)
+                module = import_module(module)
+                main = deepgetattr(module, main)
+                if not callable(main):
+                    raise ValueError
+            except ValueError:
+                error('--main must be like module.path.to:main function')
+            else:
                 log.info('Running %s', entry_point)
-                is_imported = True
-            except ImportError as e:
-                is_imported = False
+                main()
 
-            # Entry point is not a module but a main function
-            if not is_imported:
-                try:
-                    module, entry = entry_point.rsplit('.', 1)
-                    log.debug('Failed. Importing module %s', module)
-                    module = import_module(module)
-                    log.info('Running %s', entry_point)
-                    entry = getattr(module, entry)
-                except (ValueError, ImportError) as e:
-                    error("Can't import '%s': %s", module, e)
-                # If entry is not a module but a (main) function, do call it
-                if not callable(entry):
-                    error('%s is not a function', entry_point)
-                entry()
-
-        args.main = _run
+        args.main = _main
     if args.record:
         try: args.record = open(args.record, 'wb')
         except Exception as e:
@@ -372,11 +363,6 @@ class Resolver:
     @lru_cache()
     def deserialize_type(type_str):
         """Return type object that corresponds to type_str"""
-
-        def deepgetattr(obj, attr):
-            """Recurses through an attribute chain to get the ultimate value."""
-            return reduce(getattr, attr.split('.'), obj)
-
         module, qualname = type_str.split(':')
         return deepgetattr(import_module(module), qualname)
 
