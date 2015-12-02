@@ -24,7 +24,8 @@ except ImportError:  # Py2
             return f
         return decorator
 
-REAL_EXIT = sys.exit
+
+SCENARIO_VERSION = 1
 
 
 def parse_args():
@@ -511,7 +512,7 @@ def EventRecorder():
 
         def __init__(self):
             super().__init__()
-            self.events = []
+            self.events = [SCENARIO_VERSION]
 
         def eventFilter(self, obj, event):
             # Only process out-of-application, system (e.g. X11) events
@@ -536,7 +537,8 @@ def EventRecorder():
             try: import cPickle as pickle
             except ImportError: import pickle
             pickle.dump(self.events, file, protocol=0)
-            log.info("Scenario written into '%s'", file.name)
+            log.info("Scenario of %d events written into '%s'",
+                     len(self.events) - SCENARIO_VERSION, file.name)
 
     return EventRecorder()
 
@@ -565,6 +567,7 @@ def EventReplayer():
             try: import cPickle as pickle
             except ImportError: import pickle
             self.events = iter(pickle.load(file))
+            self.format_version = next(self.events)
 
         def eventFilter(self, obj, event):
             if not self.started:
