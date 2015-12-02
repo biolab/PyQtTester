@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
-import sys
+import sys; REAL_EXIT = sys.exit
+from functools import reduce, wraps
 from collections import namedtuple
 from itertools import chain
 from importlib import import_module
@@ -8,6 +9,20 @@ from importlib import import_module
 # Allow termination with Ctrl+C
 import signal; signal.signal(signal.SIGINT, signal.SIG_DFL)
 
+try:
+    from functools import lru_cache
+except ImportError:  # Py2
+    def lru_cache(_):
+        def decorator(func):
+            cache = {}
+            @wraps(func)
+            def f(*args, **kwargs):
+                key = (args, tuple(kwargs.items()))
+                if key not in cache:
+                    cache[key] = func(*args, **kwargs)
+                return cache[key]
+            return f
+        return decorator
 
 REAL_EXIT = sys.exit
 
@@ -346,6 +361,24 @@ class Resolver:
         event = eval('QtGui.' + event[0] + '(' + ', '.join(event[1:]) + ')')
         return event
 
+    @staticmethod
+    def serialize_type(type_obj):
+        """Return fully-qualified name of type, or '' if translation not reversible"""
+        type_str = type_obj.__module__ + ':' + type_obj.__qualname__
+        return type_str if '.<locals>.' not in type_str else ''
+
+    @staticmethod
+    @lru_cache()
+    def deserialize_type(type_str):
+        """Return type object that corresponds to type_str"""
+
+        def deepgetattr(obj, attr):
+            """Recurses through an attribute chain to get the ultimate value."""
+            return reduce(getattr, attr.split('.'), obj)
+
+        module, qualname = type_str.split(':')
+        return deepgetattr(import_module(module), qualname)
+
     @classmethod
     def serialize_object(cls, obj):
         assert any('QObject' == cls.__name__
@@ -365,11 +398,9 @@ class Resolver:
                 parent = parent.parent()
             yield obj, _index_by_type(QtGui.qApp.topLevelWidgets(), obj)
 
-        # path = '/'.join(reversed(['[{}]{}({})'.format(index_by_type,
-        #                                               type(obj).__name__,
-        #                                               obj.objectName())
-        #                           for obj, index_by_type in _canonical_path(obj)]))
-        path = tuple(reversed([PathElement(index_by_type, type(obj), obj.objectName())
+        path = tuple(reversed([PathElement(index_by_type,
+                                           cls.serialize_type(obj.__class__),
+                                           obj.objectName())
                                for obj, index_by_type in _canonical_path(obj)]))
         log.debug('Serialized object path: %s', path)
         return path
@@ -377,9 +408,11 @@ class Resolver:
     @classmethod
     def deserialize_object(cls, qApp, path):
         target = path[-1]
+        target_type = cls.deserialize_type(target.type)
+
         # Find target object by name
         if target.name:
-            obj = qApp.findChild(target.type, target.name)
+            obj = qApp.findChild(target_type, target.name)
             if obj:
                 return obj
 
@@ -403,7 +436,7 @@ class Resolver:
             if not cls.FUZZY_MATCHING:
                 target = path[i + 1]
                 try:
-                    children = (filtertype(target.type, children)[target.index],)
+                    children = (filtertype(target_type, children)[target.index],)
                 except IndexError:
                     # Insufficient children of correct type
                     return
@@ -417,7 +450,7 @@ class Resolver:
         widgets = qApp.topLevelWidgets()
         if not cls.FUZZY_MATCHING:
             try:
-                widgets = (filtertype(target.type, widgets)[target.index],)
+                widgets = (filtertype(target_type, widgets)[target.index],)
             except IndexError:
                 return
         for window in widgets:
