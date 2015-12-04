@@ -3,7 +3,7 @@
 import sys; REAL_EXIT = sys.exit
 from functools import reduce, wraps
 from collections import namedtuple
-from itertools import chain
+from itertools import chain, islice
 from importlib import import_module
 
 # Allow termination with Ctrl+C
@@ -31,6 +31,11 @@ SCENARIO_VERSION = 1
 def deepgetattr(obj, attr):
     """Recurses through an attribute chain to get the ultimate value."""
     return reduce(getattr, attr.split('.'), obj)
+
+
+def nth(n, iterable, default=None):
+    """Return the n-th item of iterable"""
+    return next(islice(iterable, n, None), default)
 
 
 def parse_args():
@@ -367,43 +372,121 @@ class Resolver:
         return deepgetattr(import_module(module), qualname)
 
     @classmethod
+    def _get_children(cls, widget):
+        """
+        Get child widgets of widget. Normally children are added in layout,
+        but not for some widgets.
+        """
+        if isinstance(widget, QtGui.QSplitter):
+            return chain((widget.widget(i) for i in range(widget.count())),
+                         (widget.handle(i) for i in range(widget.count())))
+        elif hasattr(widget, 'layout') and widget.layout():
+            return (widget.layout().itemAt(i).widget()
+                    for i in range(widget.layout().count()))
+        return ()
+
+    @classmethod
     def serialize_object(cls, obj):
-        assert any('QObject' == cls.__name__
+        assert any('QWidget' == cls.__name__
                    for cls in type(obj).mro()), (obj, type(obj).mro())
-
-        def _canonical_path(obj):
-
-            def _index_by_type(lst, obj):
-                return [i for i in lst if type(i) == type(obj)].index(obj)
-
-            if not obj.parent():
-                pass
-            parent = obj.parent()
-            while parent is not None:
-                yield obj, _index_by_type(parent.children(), obj)
-                obj = parent
-                parent = parent.parent()
-            yield obj, _index_by_type(QtGui.qApp.topLevelWidgets(), obj)
-
-        path = tuple(reversed([PathElement(index_by_type,
-                                           cls.serialize_type(obj.__class__),
-                                           obj.objectName())
-                               for obj, index_by_type in _canonical_path(obj)]))
-        log.debug('Serialized object path: %s', path)
+        ## Better, bottom-up implementation below
+        # class Result(Exception):
+        #     pass
+        #
+        # def widget_path(widget, path=[]):
+        #     try:
+        #         prev = path[-1]
+        #         if prev is widget:
+        #             raise Result(path)
+        #         layout = prev.layout()
+        #         child_widgets = (layout.itemAt(i).widget()
+        #                          for i in range(layout.count())) if layout else ()
+        #     except IndexError:
+        #         child_widgets = qApp.topLevelWidgets()
+        #     for w in child_widgets:
+        #         widget_path(widget, path + [w])
+        #
+        # try: widget_path(obj, [])
+        # except Result as result:
+        #     path = result.args[0]
+        # else:
+        #     log.info('Skipping widget not in hierarchy: %s',
+        #              obj.__class__.__name__)
+        #     return None
+        path = []
+        parent = obj
+        while parent:
+            widget, parent = parent, parent.parentWidget()
+            children = cls._get_children(parent) if parent else qApp.topLevelWidgets()
+            # This typed index is more resilient than simple layout.indexOf()
+            index = next((i for i, w in enumerate(w for w in children
+                                                  if type(w) == type(widget))
+                          if w is widget), None)
+            if index is None:
+                # FIXME: What to do here instead?
+                if path:
+                    log.warning('Skipping object path: %s -> %s', obj,
+                                path)
+                path = ()
+                break
+            path.append(PathElement(index,
+                                    cls.serialize_type(type(widget)),
+                                    widget.objectName()))
+        assert (not path or
+                (len(path) > 1 and obj not in qApp.topLevelWidgets()) or
+                (len(path) == 1 and obj in qApp.topLevelWidgets()))
+        if path:
+            path = tuple(reversed(path))
+            log.debug('Serialized object path: %s', path)
         return path
 
     @classmethod
-    def deserialize_object(cls, qApp, path):
+    def _find_by_name(cls, target):
+        return (qApp.findChild(cls.deserialize_type(target.type), target.name) or
+                next(widget for widget in qApp.allWidgets()
+                     if widget.objectName() == target.name))
+
+    @classmethod
+    def deserialize_object(cls, path):
         target = path[-1]
         target_type = cls.deserialize_type(target.type)
 
         # Find target object by name
         if target.name:
-            obj = qApp.findChild(target_type, target.name)
-            if obj:
-                return obj
+            try:
+                return cls._find_by_name(target)
+            except StopIteration:
+                log.warning('Name "%s" provided, but no *widget* with that name '
+                            'found. If the test passes, its result might be '
+                            'invalid, or the test may just need updating.',
+                            target.name)
 
-        # If target doesn't have a name, find the object in the tree
+        # If target widget doesn't have a name, find it in the tree
+        def candidates(path, i, widgets):
+            if i == len(path):
+                return iter(widgets)
+            target = path[i]
+            target_type = cls.deserialize_type(target.type)
+            return candidates(path, i + 1,
+                              cls._get_children(nth(target.index,
+                                                    (w for w in widgets
+                                                     if type(w) == target_type))))
+
+        target_with_name = next((i for i in reversed(path) if i.name), None)
+        if target_with_name:
+            i = path.index(target_with_name)
+            try:
+                return next(candidates(path, i,
+                                       (cls._find_by_name(target_with_name),)))
+            except StopIteration:
+                pass
+
+        widgets = qApp.topLevelWidgets()
+        return next(candidates(path, 0, widgets), None)
+
+
+
+
         # FIXME: The logic here may need rework
 
         def filtertype(target_type, iterable):
@@ -451,12 +534,18 @@ class Resolver:
     @classmethod
     def getstate(cls, obj, event):
         """Return picklable state of the object and its event"""
-        return (cls.serialize_object(obj),
-                cls.serialize_event(event))
+        obj_path = cls.serialize_object(obj)
+        if not obj_path:
+            log.debug('Skipping object: %s', obj)
+            return None
+        event_str = cls.serialize_event(event)
+        if not event_str:
+            log.debug('Skipping event: %s', event)
+        return (obj_path, event_str)
 
     @classmethod
-    def setstate(cls, qApp, obj_path, event_str):
-        obj = cls.deserialize_object(qApp, obj_path)
+    def setstate(cls, obj_path, event_str):
+        obj = cls.deserialize_object(obj_path)
         if obj is None:
             log.error("Can't replay event %s on object %s: Object not found",
                       event_str, obj_path)
@@ -508,14 +597,17 @@ def EventRecorder():
                 log.warning('Got signal event!')
             if event.type() == QtCore.QEvent.StateMachineSignal:
                 log.warning('Got signal event!')
-            is_skipped = event.type() not in self.QEVENT_EVENTS
+            is_skipped = (event.type() not in self.QEVENT_EVENTS or
+                          not isinstance(obj, QWidget))  # FIXME: This condition is too strict
             log.debug('Caught %s%s %s event: %s',
                       'spontaneous ' if event.spontaneous() else '',
                       'skipped' if is_skipped else 'recorded',
                       EVENT_TYPE.get(event.type(), 'Unknown(type=' + str(event.type()) + ')'),
                       type(event))
             if not is_skipped:
-                self.events.append(Resolver.getstate(obj, event))
+                serialized = Resolver.getstate(obj, event)
+                if serialized:
+                    self.events.append(serialized)
             return False
 
         def dump(self, file):
@@ -534,7 +626,6 @@ def EventReplayer():
     Return an instance of EventReplayer with closure over correct
     (PyQt4's or PyQt5's) version of QtCore.
     """
-    global QtCore, QtGui
 
     class EventReplayer(QtCore.QObject):
 
@@ -583,6 +674,8 @@ def EventReplayer():
 
         @QtCore.pyqtSlot()
         def replay_next_event(self):
+            # TODO: if timer took too long (significantly more than its interval)
+            # perhaps there was a busy loop in the code; better restart it
             self.timer.stop()
             event = next(self.events, None)
             if not event:
@@ -590,7 +683,7 @@ def EventReplayer():
                 QtGui.qApp.quit()
                 return
             log.debug('Replaying event: %s', event)
-            Resolver.setstate(QtGui.qApp, *event)
+            Resolver.setstate(*event)
             return False
 
     return EventReplayer()
@@ -600,11 +693,18 @@ def main():
     args = parse_args()
 
     # Set some global variables
-    global QtGui, QtCore, Qt, QT_KEYS, EVENT_TYPE
+    global QtGui, QtCore, QWidget, Qt, qApp, QT_KEYS, EVENT_TYPE
     PyQt = 'PyQt' + str(args.qt)
     QtGui = import_module(PyQt + '.QtGui')
     QtCore = import_module(PyQt + '.QtCore')
     Qt = QtCore.Qt
+    try:
+        QWidget = QtGui.QWidget
+        qApp = QtGui.qApp
+    except AttributeError:  # PyQt5
+        QtWidgets = import_module(PyQt + '.QtWidgets')
+        QWidget = QtWidgets.QWidget
+        qApp = QtWidgets.qApp
     QT_KEYS = {value: 'Qt.' + key
                for key, value in Qt.__dict__.items()
                if key.startswith('Key_')}
