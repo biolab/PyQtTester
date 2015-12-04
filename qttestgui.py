@@ -6,11 +6,13 @@ from collections import namedtuple
 from itertools import chain, islice
 from importlib import import_module
 
+try: import cPickle as pickle
+except ImportError: import pickle
+
 # Allow termination with Ctrl+C
 import signal; signal.signal(signal.SIGINT, signal.SIG_DFL)
 
-try:
-    from functools import lru_cache
+try: from functools import lru_cache
 except ImportError:  # Py2
     def lru_cache(_):
         def decorator(func):
@@ -359,6 +361,7 @@ class Resolver:
         return event
 
     @staticmethod
+    @lru_cache()
     def serialize_type(type_obj):
         """Return fully-qualified name of type, or '' if translation not reversible"""
         type_str = type_obj.__module__ + ':' + type_obj.__qualname__
@@ -463,8 +466,11 @@ class Resolver:
 
         # If target widget doesn't have a name, find it in the tree
         def candidates(path, i, widgets):
-            if i == len(path):
-                return iter(widgets)
+            if i == len(path) - 1:
+                return iter((nth(path[i].index,
+                                 (w for w in widgets
+                                  if type(w) == cls.deserialize_type(path[i].type))),
+                             ))
             target = path[i]
             target_type = cls.deserialize_type(target.type)
             return candidates(path, i + 1,
@@ -554,16 +560,39 @@ class Resolver:
         return qApp.sendEvent(obj, event)
 
 
-def EventRecorder():
-    """
-    Return an instance of EventRecorder with closure over correct
-    (PyQt4's or PyQt5's) version of QtCore.QObject.
-    """
-    global QtCore
+class _EventFilter:
 
-    class EventRecorder(QtCore.QObject):
+    @staticmethod
+    def wait_for_app_start(method):
+        is_started = False
 
-        QEVENT_EVENTS = {
+        def f(self, obj, event):
+            nonlocal is_started
+            if not is_started:
+                log.debug(
+                    'Caught %s (%s) event but app not yet fully "started"',
+                    EVENT_TYPE.get(event.type(),
+                                   'QEvent(type=' + str(event.type()) + ')'),
+                    type(event).__name__)
+                if event.type() == QtCore.QEvent.ActivationChange:
+                    log.debug("Ok, app is started now, don't worry")
+                    is_started = True
+            # With the following return in place, Xvfb sometimes got stuck
+            # before any serious events happened. I suspected WM (or lack
+            # thereof) being the culprit, so now we spawn a WM that sends
+            # focus, activation events, ... This seems to have fixed it once.
+            # I think this return (False) should be here (instead of proceeding
+            # with the filter method).
+            return method(self, obj, event) if is_started else False
+        return f
+
+
+class EventRecorder(_EventFilter):
+    def __init__(self):
+        super().__init__()
+        self.events = [SCENARIO_VERSION]
+
+        self.QEVENT_EVENTS = {
             # Events that extend QEvent
             # QtCore.QEvent.Close,
             # QtCore.QEvent.ContextMenu,
@@ -585,108 +614,84 @@ def EventRecorder():
             QtCore.QStateMachine.SignalEvent,  # This doesn't work, forget about it
         }
 
-        def __init__(self):
-            super().__init__()
-            self.events = [SCENARIO_VERSION]
+    @_EventFilter.wait_for_app_start
+    def eventFilter(self, obj, event):
+        # Only process out-of-application, system (e.g. X11) events
+        # if not event.spontaneous():
+        #     return False
+        is_skipped = (event.type() not in self.QEVENT_EVENTS or
+                      not isinstance(obj, QWidget))  # FIXME: This condition is too strict (QGraphicsItems are QOjects)
+        log.debug('Caught %s%s %s event: %s',
+                  'spontaneous ' if event.spontaneous() else '',
+                  'skipped' if is_skipped else 'recorded',
+                  EVENT_TYPE.get(event.type(), 'Unknown(type=' + str(event.type()) + ')'),
+                  type(event))
+        if not is_skipped:
+            serialized = Resolver.getstate(obj, event)
+            if serialized:
+                self.events.append(serialized)
+        return False
 
-        def eventFilter(self, obj, event):
-            # Only process out-of-application, system (e.g. X11) events
-            # if not event.spontaneous():
-            #     return False
-            if isinstance(event, QtCore.QStateMachine.SignalEvent):
-                log.warning('Got signal event!')
-            if event.type() == QtCore.QEvent.StateMachineSignal:
-                log.warning('Got signal event!')
-            is_skipped = (event.type() not in self.QEVENT_EVENTS or
-                          not isinstance(obj, QWidget))  # FIXME: This condition is too strict
-            log.debug('Caught %s%s %s event: %s',
-                      'spontaneous ' if event.spontaneous() else '',
-                      'skipped' if is_skipped else 'recorded',
-                      EVENT_TYPE.get(event.type(), 'Unknown(type=' + str(event.type()) + ')'),
-                      type(event))
-            if not is_skipped:
-                serialized = Resolver.getstate(obj, event)
-                if serialized:
-                    self.events.append(serialized)
+    def dump(self, file):
+        log.debug('Writing scenario file')
+        pickle.dump(self.events, file, protocol=0)
+        log.info("Scenario of %d events written into '%s'",
+                 len(self.events) - SCENARIO_VERSION, file.name)
+
+
+class EventReplayer(_EventFilter):
+    def __init__(self):
+        super().__init__()
+        # Replay events X ms after the last event
+        self.timer = QtCore.QTimer(self, interval=100)
+        self.timer.timeout.connect(self.replay_next_event)
+
+    def load(self, file):
+        self.events = iter(pickle.load(file))
+        self.format_version = next(self.events)
+
+    @_EventFilter.wait_for_app_start
+    def eventFilter(self, obj, event):
+        if (event.type() == QtCore.QEvent.Timer and
+                event.timerId() == self.timer.timerId()):
+            # Skip self's timer events
             return False
+        log.debug('Caught %s (%s) event; resetting timer',
+                  EVENT_TYPE.get(event.type(), 'Unknown(type=' + str(event.type()) + ')'),
+                  type(event))
+        self.timer.stop()
+        self.timer.start()
+        return False
 
-        def dump(self, file):
-            log.debug('Writing scenario file')
-            try: import cPickle as pickle
-            except ImportError: import pickle
-            pickle.dump(self.events, file, protocol=0)
-            log.info("Scenario of %d events written into '%s'",
-                     len(self.events) - SCENARIO_VERSION, file.name)
+    def replay_next_event(self):
+        # TODO: if timer took too long (significantly more than its interval)
+        # perhaps there was a busy loop in the code; better restart it
+        self.timer.stop()
+        event = next(self.events, None)
+        if not event:
+            log.info('No more events to replay.')
+            QtGui.qApp.quit()
+            return
+        log.debug('Replaying event: %s', event)
+        Resolver.setstate(*event)
+        return False
 
-    return EventRecorder()
 
-
-def EventReplayer():
+def EventFilter(type):
     """
-    Return an instance of EventReplayer with closure over correct
-    (PyQt4's or PyQt5's) version of QtCore.
+    Return an instance of type'd filter with closure over correct
+    (PyQt4's or PyQt5's) version of QtCore.QObject.
     """
-
-    class EventReplayer(QtCore.QObject):
-
-        started = False
-        i = 0
-        exitSuccessful = QtCore.pyqtSignal()
-
-        def __init__(self):
-            super().__init__()
-            self.timer = timer = QtCore.QTimer(self)
-            # Replay events X ms after the last event
-            timer.setInterval(100)
-            timer.timeout.connect(self.replay_next_event)
-
-        def load(self, file):
-            try: import cPickle as pickle
-            except ImportError: import pickle
-            self.events = iter(pickle.load(file))
-            self.format_version = next(self.events)
-
+    class EventFilter(type, QtCore.QObject):
+        """
+        This class is a wrapper around above EventRecorder / EventReplayer.
+        Qt requires that the object that filters events with eventFilter() is
+        (also) a QObject.
+        """
         def eventFilter(self, obj, event):
-            if not self.started:
-                log.debug(
-                    'Caught %s (%s) event but app not yet fully "started"',
-                    EVENT_TYPE.get(event.type(), 'Unknown(type=' + str(event.type()) + ')'),
-                    type(event).__name__)
-                if event.type() == QtCore.QEvent.ActivationChange:
-                    log.debug("Ok, app is started now, don't worry")
-                    self.started = True
-                # With the following return in place, Xvfb sometimes got stuck
-                # before any serious events happened. I suspected WM (or lack
-                # thereof) being the culprit, so now we spawn a WM that sends
-                # focus, activation events, ... This seems to have fixed it once.
-                # I think this return should be here.
-                return False
-            if (event.type() == QtCore.QEvent.Timer and
-                    event.timerId() == self.timer.timerId()):
-                # Skip self's timer events
-                return False
-            log.debug('Caught %s (%s) event; resetting timer',
-                      EVENT_TYPE.get(event.type(), 'Unknown(type=' + str(event.type()) + ')'),
-                      type(event))
-            self.timer.stop()
-            self.timer.start()
-            return False
+            return super().eventFilter(obj, event)
 
-        @QtCore.pyqtSlot()
-        def replay_next_event(self):
-            # TODO: if timer took too long (significantly more than its interval)
-            # perhaps there was a busy loop in the code; better restart it
-            self.timer.stop()
-            event = next(self.events, None)
-            if not event:
-                log.info('No more events to replay.')
-                QtGui.qApp.quit()
-                return
-            log.debug('Replaying event: %s', event)
-            Resolver.setstate(*event)
-            return False
-
-    return EventReplayer()
+    return EventFilter()
 
 
 def main():
@@ -720,10 +725,10 @@ def main():
 
     event_filters = []
     if args.record:
-        recorder = EventRecorder()
+        recorder = EventFilter(EventRecorder)
         event_filters.append(recorder)
     if args.replay:
-        replayer = EventReplayer()
+        replayer = EventFilter(EventReplayer)
         replayer.load(args.replay)
         event_filters.append(replayer)
     ...
@@ -736,7 +741,7 @@ def main():
             super().__init__(*args, **kwargs)
             for event_filter in event_filters:
                 log.debug('Installing event filter: %s',
-                          type(event_filter).__name__)
+                          type(event_filter).mro()[1].__name__)
                 self.installEventFilter(event_filter)
     QtGui.QApplication = QApplication
 
