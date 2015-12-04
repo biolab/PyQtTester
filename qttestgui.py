@@ -92,20 +92,24 @@ def parse_args():
     argparser.add_argument( # TODO
         '--coverage', action='store_true',
         help='Run the coverage analysis simultaneously.')
+    argparser.add_argument(
+        '--log', metavar='FILE',
+        help='Save the program output into file.')
     args = argparser.parse_args()
 
-    def init_logging(verbose=False):
+    def init_logging(verbose, log_file):
         import logging
         global log
-        log = logging.getLogger()
-        handler = logging.StreamHandler()
+        log = logging.getLogger(__name__)
         formatter = logging.Formatter('%(levelname)s: %(message)s')
-        handler.setFormatter(formatter)
-        log.addHandler(handler)
+        for handler in chain((logging.StreamHandler(),),
+                             (logging.FileHandler(log_file, encoding='utf-8'),) if log_file else ()):
+            handler.setFormatter(formatter)
+            log.addHandler(handler)
         if verbose:
             log.setLevel(logging.DEBUG)
 
-    init_logging(args.verbose)
+    init_logging(args.verbose, args.log)
     log.debug('Program arguments: %s', args)
 
     def error(*args, **kwargs):
