@@ -48,8 +48,8 @@ def parse_args():
     from argparse import ArgumentParser
     argparser = ArgumentParser()
     argparser.add_argument(
-        '--verbose', '-v', action='store_true',
-        help='Print verbose (debug) information.')
+        '--verbose', '-v', action='count',
+        help='Print verbose information (use twice for debug).')
     argparser.add_argument(
         '--qt', metavar='QT_VERSION', default='4', choices='45',
         help='The version of PyQt to run the entry-point app with (4 or 5).')
@@ -97,7 +97,7 @@ def parse_args():
         help='Save the program output into file.')
     args = argparser.parse_args()
 
-    def init_logging(verbose, log_file):
+    def init_logging(verbose=0, log_file=None):
         import logging
         global log
         log = logging.getLogger(__name__)
@@ -106,11 +106,10 @@ def parse_args():
                              (logging.FileHandler(log_file, encoding='utf-8'),) if log_file else ()):
             handler.setFormatter(formatter)
             log.addHandler(handler)
-        if verbose:
-            log.setLevel(logging.DEBUG)
+        log.setLevel(logging.WARNING - 10*verbose)
 
     init_logging(args.verbose, args.log)
-    log.debug('Program arguments: %s', args)
+    log.info('Program arguments: %s', args)
 
     def error(*args, **kwargs):
         log.error(*args, **kwargs)
@@ -352,7 +351,7 @@ class Resolver:
                             "for attribute {}".format(value,
                                                       value.__class__.__mro__,
                                                       attr))
-        log.debug('Serialized event: %s', args)
+        log.info('Serialized event: %s', args)
         return tuple(args)
 
     @staticmethod
@@ -444,7 +443,7 @@ class Resolver:
                 (len(path) == 1 and obj in qApp.topLevelWidgets()))
         if path:
             path = tuple(reversed(path))
-            log.debug('Serialized object path: %s', path)
+            log.info('Serialized object path: %s', path)
         return path
 
     @classmethod
@@ -546,11 +545,11 @@ class Resolver:
         """Return picklable state of the object and its event"""
         obj_path = cls.serialize_object(obj)
         if not obj_path:
-            log.debug('Skipping object: %s', obj)
+            log.warning('Skipping object: %s', obj)
             return None
         event_str = cls.serialize_event(event)
         if not event_str:
-            log.debug('Skipping event: %s', event)
+            log.warning('Skipping event: %s', event)
         return (obj_path, event_str)
 
     @classmethod
