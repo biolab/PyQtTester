@@ -335,16 +335,16 @@ class Resolver:
     }
 
     @classmethod
-    def serialize_event(cls, event):
-        assert any('QEvent' == cls.__name__
-                   for cls in event.__class__.__mro__), (event, event.__class__.__mro__)
+    def serialize_event(cls, event) -> str:
+        assert isinstance(event, QtCore.QEvent)
+
         event_type = type(event)
         event_attributes = cls.EVENT_ATTRIBUTES.get(event_type.__name__, ('type',))
         if not event_attributes:
-            log.warning('Unknown event: %s, type=%s, mro=%s',
+            log.warning('Missing fingerprint for event: %s, type=%s, mro=%s',
                         event_type, event.type(), event_type.__mro__)
 
-        args = [event_type.__name__]
+        args = []
         if event_attributes and event_attributes[0] == 'type':
             args.append('QtCore.' + cls._qenum_key(QtCore.QEvent, event.type()))
             # Skip first element (type) in the loop ahead
@@ -353,20 +353,20 @@ class Resolver:
             value = getattr(event, attr)()
             try: args.append(cls._serialize_value(value, attr))
             except ValueError:
-                log.warning("Can't serialize object {} of type {} "
-                            "for attribute {}".format(value,
-                                                      value.__class__.__mro__,
-                                                      attr))
-        log.info('Serialized event: %s', args)
-        return tuple(args)
+                args.append('0b0')
+                log.warning("Can't serialize object %s of type %s "
+                            "for attribute %s. Inserting a 0b0 (zero) instead.",
+                            value, type(value).__mro__, attr)
+        event_str = event_type.__name__ + '(' + ', '.join(args) + ')'
+        log.info('Serialized event: %s', event_str)
+        return event_str
 
     @staticmethod
-    def deserialize_event(event):
-        if event[0] == 'QEvent':   # Generic, unspecialized QEvent
-            assert len(event) == 2
-            event = QtCore.QEvent(eval(event[1]))
-            return event
-        event = eval('QtGui.' + event[0] + '(' + ', '.join(event[1:]) + ')')
+    def deserialize_event(event_str):
+        if event_str.startswith('QEvent('):   # Generic, unspecialized QEvent
+            event = eval('QtCore.' + event_str)  # FIXME: deprecate?
+        else:
+            event = eval('QtGui.' + event_str)
         return event
 
     @staticmethod
