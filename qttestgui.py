@@ -46,8 +46,12 @@ def parse_args():
     # — I don't know, but most WMs I tried didn't work)
     WINDOW_MANAGERS = ('windowlab',)
 
-    from argparse import ArgumentParser
-    argparser = ArgumentParser()
+    from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
+    argparser = ArgumentParser(
+        description='A tool for testing PyQt GUI applications by recording'
+                    'and replaying scenarios.',
+        formatter_class=ArgumentDefaultsHelpFormatter,
+    )
     argparser.add_argument(
         '--verbose', '-v', action='count',
         help='Print verbose information (use twice for debug).')
@@ -395,32 +399,8 @@ class Resolver:
 
     @classmethod
     def serialize_object(cls, obj):
-        assert any('QWidget' == cls.__name__
-                   for cls in type(obj).mro()), (obj, type(obj).mro())
-        ## Better, bottom-up implementation below
-        # class Result(Exception):
-        #     pass
-        #
-        # def widget_path(widget, path=[]):
-        #     try:
-        #         prev = path[-1]
-        #         if prev is widget:
-        #             raise Result(path)
-        #         layout = prev.layout()
-        #         child_widgets = (layout.itemAt(i).widget()
-        #                          for i in range(layout.count())) if layout else ()
-        #     except IndexError:
-        #         child_widgets = qApp.topLevelWidgets()
-        #     for w in child_widgets:
-        #         widget_path(widget, path + [w])
-        #
-        # try: widget_path(obj, [])
-        # except Result as result:
-        #     path = result.args[0]
-        # else:
-        #     log.info('Skipping widget not in hierarchy: %s',
-        #              obj.__class__.__name__)
-        #     return None
+        assert isinstance(obj, QWidget)
+
         path = []
         parent = obj
         while parent:
@@ -471,6 +451,7 @@ class Resolver:
 
         # If target widget doesn't have a name, find it in the tree
         def candidates(path, i, widgets):
+            # TODO: make this function nicer
             if i == len(path) - 1:
                 return iter((nth(path[i].index,
                                  (w for w in widgets
@@ -639,11 +620,12 @@ class EventReplayer(_EventFilter):
     def __init__(self):
         super().__init__()
         # Replay events X ms after the last event
-        self.timer = QtCore.QTimer(self, interval=100)
+        self.timer = QtCore.QTimer(self, interval=1000)
         self.timer.timeout.connect(self.replay_next_event)
 
     def load(self, file):
-        self.events = iter(pickle.load(file))
+        self._events = pickle.load(file)
+        self.events = iter(self._events)
         self.format_version = next(self.events)
 
     @_EventFilter.wait_for_app_start
