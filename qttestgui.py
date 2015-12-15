@@ -220,7 +220,7 @@ class Resolver:
         >>> _qenum_key(Qt, Qt.LeftButton | Qt.RightButton)
         ''
         """
-        klass = klass or value.__class__
+        klass = klass or type(value)
 
         if klass == int:  # Can't guess enum class of an int
             return ''
@@ -268,7 +268,7 @@ class Resolver:
         ----
         https://github.com/The-Compiler/qutebrowser/issues/42
         """
-        klass = klass or value.__class__
+        klass = klass or type(value)
         if klass == int:
             return ''
         if klass.__name__.endswith('s'):
@@ -301,15 +301,15 @@ class Resolver:
         # docs. The reason they are not used like this here is consistency and
         # smaller size. Yes, this string is >100% more light-weight.
         if isinstance(value, (QtCore.QPointF, QtCore.QPoint)):
-            return 'QtCore.{}({}, {})'.format(value.__class__.__name__,
+            return 'QtCore.{}({}, {})'.format(type(value).__name__,
                                               value.x(),
                                               value.y())
         if isinstance(value, (QtCore.QRectF, QtCore.QRect)):
-            return 'QtCore.{}({}, {})'.format(value.__class__.__name__,
-                                              value.x(),
-                                              value.y(),
-                                              value.width(),
-                                              value.height())
+            return 'QtCore.{}({}, {}, {}, {})'.format(type(value).__name__,
+                                                      value.x(),
+                                                      value.y(),
+                                                      value.width(),
+                                                      value.height())
         # Perhaps it's an enum value from Qt namespace
         assert isinstance(Qt.LeftButton, int)
         if isinstance(value, int):
@@ -320,7 +320,7 @@ class Resolver:
         # bitwise or-ing Qt.MouseButton values (Qt.LeftButton | Qt.RightButton)
         # makes a Qt.MouseButtons object:
         assert isinstance((Qt.LeftButton | Qt.RightButton), Qt.MouseButtons)
-        if value.__class__.__name__.endswith('s'):
+        if type(value).__name__.endswith('s'):
             s = cls._qflags_key(Qt, value)
             if s:
                 return s
