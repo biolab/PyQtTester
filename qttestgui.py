@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import sys; REAL_EXIT = sys.exit
+import re
 from functools import reduce, wraps
 from collections import namedtuple
 from itertools import chain, islice
@@ -68,19 +69,20 @@ def parse_args():
     argparser.add_argument(
         '--main', '-m', metavar='MODULE_PATH',
         help='The application entry point (module.path.to:main function).')
-    argparser.add_argument( # TODO
+    argparser.add_argument(
         '--events-include', metavar='FILTER',
-        help='When recording, record only events that match the filter.')
-    argparser.add_argument( # TODO
+        default=r'MouseEvent,KeyEvent', # 'Drag,Focus,Hover'
+        help='When recording, record only events that match the (regex) filters.')
+    argparser.add_argument(
         '--events-exclude', metavar='FILTER',
-        help="When recording, skip events that match the filter.")
+        help="When recording, skip events that match the (regex) filters.")
     argparser.add_argument( # TODO
         '--objects-include', metavar='FILTER',
-        help='When recording, record only events on objects that match the filter.')
+        help='When recording, record only events on objects that match the (regex) filters.')
     argparser.add_argument( # TODO
         '--objects-exclude', metavar='FILTER',
-        help="When recording, skip events on objects that match the filter.")
-    argparser.add_argument(
+        help="When recording, skip events on objects that match the (regex) filter.")
+    argparser.add_argument( # TODO
         '--fuzzy', action='store_true',
         help='Fuzzy-matching of event target objects.')
     argparser.add_argument(
@@ -591,44 +593,34 @@ class _EventFilter:
 
 
 class EventRecorder(_EventFilter):
-    def __init__(self):
+    def __init__(self, events_include, events_exclude):
         super().__init__()
+
+        # Prepare the recorded events stack;
+        # the first entry is the protocol version
         self.events = [SCENARIO_VERSION]
 
-        self.QEVENT_EVENTS = {
-            # Events that extend QEvent
-            # QtCore.QEvent.Close,
-            # QtCore.QEvent.ContextMenu,
-            QtCore.QEvent.DragEnter,
-            QtCore.QEvent.DragLeave,
-            QtCore.QEvent.DragMove,
-            QtCore.QEvent.Drop,
-            QtCore.QEvent.Enter,
-            # QtCore.QEvent.FocusIn,
-            # QtCore.QEvent.FocusOut,
-            QtCore.QEvent.KeyPress,
-            QtCore.QEvent.KeyRelease,
-            QtCore.QEvent.MouseButtonDblClick,
-            QtCore.QEvent.MouseButtonPress,
-            QtCore.QEvent.MouseButtonRelease,
-            QtCore.QEvent.MouseMove,
-            QtCore.QEvent.Move,
-            # QtCore.QEvent.Resize,
-            QtCore.QStateMachine.SignalEvent,  # This doesn't work, forget about it
-        }
+        is_included = re.compile('|'.join(events_include.split(','))).search
+        is_excluded = re.compile('|'.join(events_exclude.split(','))).search
+
+        def event_matches(event_name):
+            return is_included(event_name) and not is_excluded(event_name)
+
+        self.event_matches = event_matches
 
     @_EventFilter.wait_for_app_start
     def eventFilter(self, obj, event):
         # Only process out-of-application, system (e.g. X11) events
         # if not event.spontaneous():
         #     return False
-        is_skipped = (event.type() not in self.QEVENT_EVENTS or
+        is_skipped = (not self.event_matches(type(event).__name__) or
                       not isinstance(obj, QWidget))  # FIXME: This condition is too strict (QGraphicsItems are QOjects)
-        log.debug('Caught %s%s %s event: %s',
-                  'spontaneous ' if event.spontaneous() else '',
-                  'skipped' if is_skipped else 'recorded',
-                  EVENT_TYPE.get(event.type(), 'Unknown(type=' + str(event.type()) + ')'),
-                  type(event))
+        log_ = log.debug if is_skipped else log.info
+        log_('Caught %s%s %s event: %s',
+             'spontaneous ' if event.spontaneous() else '',
+             'skipped' if is_skipped else 'recorded',
+             EVENT_TYPE.get(event.type(), 'Unknown(type=' + str(event.type()) + ')'),
+             type(event))
         if not is_skipped:
             serialized = Resolver.getstate(obj, event)
             if serialized:
@@ -640,6 +632,7 @@ class EventRecorder(_EventFilter):
         pickle.dump(self.events, file, protocol=0)
         log.info("Scenario of %d events written into '%s'",
                  len(self.events) - SCENARIO_VERSION, file.name)
+        log.info(self.events)
 
 
 class EventReplayer(_EventFilter):
@@ -680,7 +673,7 @@ class EventReplayer(_EventFilter):
         return False
 
 
-def EventFilter(type):
+def EventFilter(type, *args):
     """
     Return an instance of type'd filter with closure over correct
     (PyQt4's or PyQt5's) version of QtCore.QObject.
@@ -694,7 +687,7 @@ def EventFilter(type):
         def eventFilter(self, obj, event):
             return super().eventFilter(obj, event)
 
-    return EventFilter()
+    return EventFilter(*args)
 
 
 def main():
@@ -728,7 +721,9 @@ def main():
 
     event_filters = []
     if args.record:
-        recorder = EventFilter(EventRecorder)
+        recorder = EventFilter(EventRecorder,
+                               args.events_include or r'.',
+                               args.events_exclude or r'^$')
         event_filters.append(recorder)
     if args.replay:
         replayer = EventFilter(EventReplayer)
