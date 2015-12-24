@@ -69,9 +69,9 @@ def parse_args():
     group.add_argument(
         '--replay', metavar='SCENARIO',
         help='Replay the scenario.')
-    group.add_argument( # TODO
+    group.add_argument(
         '--info', metavar='SCENARIO',
-        help='Explain in human-readable form events the scenario contains.')
+        help='Explain in semi-human-readable form events the scenario contains.')
     argparser.add_argument(
         '--main', '-m', metavar='MODULE_PATH',
         help='The application entry point (module.path.to:main function).')
@@ -155,6 +155,10 @@ def parse_args():
         try: args.replay = open(args.replay, 'rb')
         except Exception as e:
             error('--replay: %s', e)
+    if args.info:
+        try: args.info = open(args.info, 'rb')
+        except Exception as e:
+            error('--info: %s', e)
     if args.coverage:
         # TODO: https://coverage.readthedocs.org/en/coverage-4.0.2/api.html#api
         #       https://nose.readthedocs.org/en/latest/plugins/cover.html#source
@@ -599,6 +603,18 @@ class Resolver:
         event = cls.deserialize_event(event_str)
         return qApp.sendEvent(obj, event)
 
+    @classmethod
+    def print_state(cls, i, obj_path, event_str):
+        print('Event', str(i) + ':', event_str.replace('QtCore.', ''))
+        print('Object:')
+        for indent, el in enumerate(obj_path):
+            print('  '*(indent + 1),
+                  el.index,
+                  repr(el.name) if el.name else '',
+                  el.type)
+        print()
+
+
 
 class _EventFilter:
 
@@ -709,6 +725,17 @@ class EventReplayer(_EventFilter):
         return False
 
 
+class EventExplainer:
+    def load(self, file):
+        self._events = pickle.load(file)
+        self.events = iter(self._events)
+        self.format_version = next(self.events)
+
+    def run(self):
+        for i, event in enumerate(self.events):
+            Resolver.print_state(i, *event)
+
+
 def EventFilter(type, *args):
     """
     Return an instance of type'd filter with closure over correct
@@ -754,6 +781,12 @@ def main():
     # been made available above.
     assert 'Qt.LeftButton|Qt.RightButton' == \
            Resolver._qflags_key(Qt, Qt.LeftButton|Qt.RightButton)
+
+    if args.info:
+        explainer = EventExplainer()
+        explainer.load(args.info)
+        explainer.run()
+        return 0
 
     event_filters = []
     if args.record:
