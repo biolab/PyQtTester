@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
 import sys; REAL_EXIT = sys.exit
+import os
 import re
+import subprocess
 from functools import reduce, wraps
 from collections import namedtuple
 from itertools import chain, islice
@@ -95,6 +97,9 @@ def parse_args():
               "This makes your app's stdout piped to stderr. "
               "It will work better (or at all) if you make one of the following "
               "window managers available: " + ', '.join(WINDOW_MANAGERS)) + '.')
+    argparser.add_argument(
+        '--x11-video', metavar='FILE', nargs='?', const=True,
+        help='Record the video of scenario playback into FILE (default: SCENARIO.mp4).')
     argparser.add_argument( # TODO
         '--coverage', action='store_true',
         help='Run the coverage analysis simultaneously.')
@@ -155,34 +160,83 @@ def parse_args():
         #       https://nose.readthedocs.org/en/latest/plugins/cover.html#source
         ...
 
+    def is_command_available(command):
+        try:
+            if 0 != subprocess.call(command, shell=True, stdout=subprocess.DEVNULL):
+                raise OSError
+        except OSError:
+            return False
+        return True
+
+    if args.x11_video:
+        if not is_command_available('ffmpeg --help'):
+            error('Recording video of X11 session (--x11-video) requires working '
+                  'ffmpeg. Install package ffmpeg.')
+        if not args.replay:
+            error('--x11-video requires --replay')
+        if not args.x11:
+            log.warning('--x11-video implies --x11')
+            args.x11 = True
+        if args.x11_video is True:
+            args.x11_video = args.replay.name + '.mp4'
     if args.x11:
         if not args.replay:
             error('--x11 requires --replay')
         # Escalate the power of shell
-        import subprocess
-        try:
-            if 0 != subprocess.call(['xvfb-run', '--help'],
-                                    stdout=subprocess.DEVNULL):
-                raise OSError
-        except OSError:
+        if not is_command_available('xvfb-run --help'):
             error('Headless X11 (--x11) requires working xvfb-run. Install package xvfb.')
         log.info('Re-running head-less in Xvfb. '
                  # The following cannot be avoided because Xvfb writes all app's
                  # output, including stderr, to stdout
                  'All subprocess output (including stdout) will be piped to stderr.')
-        sys.argv.remove('--x11')  # Prevent recursion
-        from os import path
-        REAL_EXIT(subprocess.call(
-            ['xvfb-run',
-             '--server-args', '-fbdir /tmp -screen 0 1280x1024x16',
-             '--auth-file', path.join(path.expanduser('~'), '.Xauthority'),
-             # Run in a new shell because multiple commands
-             'sh', '-c',
-             # Try to spawn a lightweight window manager
-             ' '.join('{} 2>/dev/null &'.format(wm) for wm in WINDOW_MANAGERS) +
-             ' sleep .5 ; ' +
-             ' '.join(sys.argv)],
-            stdout=sys.stderr))
+        # Prevent recursion
+        for arg in ('--x11',
+                    '--x11-video'):
+            try: sys.argv.remove(arg)
+            except ValueError: pass
+
+        command_line = r'''
+start_x11 () {{
+    xvfb-run --server-args '-fbdir /tmp -screen 0 {RESOLUTION}x16'  \
+             --auth-file {AUTH_FILE}  \
+             --server-num {DISPLAY}   \
+             sh -c '{WINDOW_MANAGERS}
+                    sleep .5;
+                    {ARGV}'
+}}
+
+start_ffmpeg () {{
+    [ "{VIDEO_FILE}" ] || return
+    ffmpeg -y -nostats -hide_banner -loglevel fatal -r 25 \
+           -f x11grab -s {RESOLUTION} -i :{DISPLAY} {VIDEO_FILE} </dev/null &
+    echo $! > $FFMPEG_PID_FILE
+}}
+
+kill_ffmpeg () {{
+    [ "{VIDEO_FILE}" ] || return
+    FFMPEG_PID=$(cat $FFMPEG_PID_FILE)
+    kill -TERM $FFMPEG_PID
+}}
+
+# First start the Xvfb instance, replaying the scenario inside.
+# Right afterwards, start screengrabbing the Xvfb session with ffmpeg.
+# When the scenario completes, kill ffmpeg as well.
+
+FFMPEG_PID_FILE=$(mktemp)
+{{ start_x11; kill_ffmpeg; }} & start_ffmpeg ; wait
+rm $FFMPEG_PID_FILE
+
+'''.format(VIDEO_FILE=args.x11_video,
+           RESOLUTION='1280x1024',
+           SCENARIO=args.replay.name,
+           AUTH_FILE=os.path.join(os.path.expanduser('~'), '.Xauthority'),
+           DISPLAY=next(i for i in range(111, 1000)
+                        if not os.path.exists('/tmp/.X{}-lock'.format(i))),
+           WINDOW_MANAGERS=' '.join('{} 2>/dev/null &'.format(wm)
+                                    for wm in WINDOW_MANAGERS),
+           ARGV=' '.join(sys.argv))
+
+        REAL_EXIT(subprocess.call(command_line, shell=True, stdout=sys.stderr))
     return args
 
 
