@@ -30,6 +30,8 @@ except ImportError:  # Py2
         return decorator
 
 
+__version__ = '0.1.0'
+
 SCENARIO_VERSION = 1
 
 
