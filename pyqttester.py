@@ -50,7 +50,7 @@ def parse_args():
 
     from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
     argparser = ArgumentParser(
-        description='A tool for testing PyQt GUI applications by recording'
+        description='A tool for testing PyQt GUI applications by recording '
                     'and replaying scenarios.',
         formatter_class=ArgumentDefaultsHelpFormatter,
     )
@@ -58,7 +58,7 @@ def parse_args():
         '--verbose', '-v', action='count',
         help='Print verbose information (use twice for debug).')
     argparser.add_argument(
-        '--qt', metavar='QT_VERSION', default='4', choices='45',
+        '--qt', metavar='QT_VERSION', default='5', choices='45',
         help='The version of PyQt to run the entry-point app with (4 or 5).')
         # TODO: default try to figure out Qt version by grepping entry-point
     group = argparser.add_mutually_exclusive_group(required=True)
@@ -112,14 +112,15 @@ def parse_args():
         import logging
         global log
         log = logging.getLogger(__name__)
-        formatter = logging.Formatter('%(levelname)s: %(message)s')
-        for handler in chain((logging.StreamHandler(),),
-                             (logging.FileHandler(log_file, encoding='utf-8'),) if log_file else ()):
-            handler.setFormatter(formatter)
-            log.addHandler(handler)
-        log.setLevel(logging.WARNING - 10*verbose)
+        formatter = logging.Formatter('%(relativeCreated)d %(levelname)s: %(message)s')
+        for handler in (logging.StreamHandler(),
+                        log_file and logging.FileHandler(log_file, 'w', encoding='utf-8')):
+            if handler:
+                handler.setFormatter(formatter)
+                log.addHandler(handler)
+        log.setLevel(logging.WARNING - 10 * verbose)
 
-    init_logging(args.verbose, args.log)
+    init_logging(args.verbose or 0, args.log)
     log.info('Program arguments: %s', args)
 
     def error(*args, **kwargs):
@@ -444,16 +445,34 @@ class Resolver:
     @classmethod
     def _get_children(cls, widget):
         """
-        Get child widgets of widget. Normally children are added in layout,
-        but not for some widgets.
+        Get all children widgets of widget. Children are if they're in widget's
+        layout, or if the widget splits them, or if they are QObject children
+        of widget, or similar.
         """
+        if not widget:
+            return qApp.topLevelWidgets()
+
+        parts = []
+
         if isinstance(widget, QtGui.QSplitter):
-            return chain((widget.widget(i) for i in range(widget.count())),
-                         (widget.handle(i) for i in range(widget.count())))
-        elif hasattr(widget, 'layout') and widget.layout():
-            return (widget.layout().itemAt(i).widget()
-                    for i in range(widget.layout().count()))
-        return ()
+            parts.append(widget.widget(i) for i in range(widget.count()))
+            parts.append(widget.handle(i) for i in range(widget.count()))
+
+        layout = getattr(widget, 'layout', lambda: None)()
+        if layout:
+            parts.append(layout.itemAt(i).widget()
+                         for i in range(layout.count()))
+
+        parts.append(getattr(widget, 'children', lambda: ())())
+
+        return chain.from_iterable(parts)
+
+    @classmethod
+    def _get_attr_children(cls, widget):
+        assert False, 'Should probably not be here'
+        return {attr: getattr(widget, attr)
+                for attr in dir(widget)
+                if not (attr.startswith('__') and attr.endswith('__'))}
 
     @classmethod
     def serialize_object(cls, obj):
@@ -463,11 +482,17 @@ class Resolver:
         parent = obj
         while parent:
             widget, parent = parent, parent.parentWidget()
-            children = cls._get_children(parent) if parent else qApp.topLevelWidgets()
+            children = cls._get_children(parent)
             # This typed index is more resilient than simple layout.indexOf()
             index = next((i for i, w in enumerate(w for w in children
                                                   if type(w) == type(widget))
                           if w is widget), None)
+            # If widget can't be found in the hierarchy by Qt means,
+            # try Python object attributes
+            if index is None:
+                children = cls._get_attr_children(parent)
+                index = next((k for k, v in children.items() if v is widget), None)
+
             if index is None:
                 # FIXME: What to do here instead?
                 if path:
@@ -479,8 +504,8 @@ class Resolver:
                                     cls.serialize_type(type(widget)),
                                     widget.objectName()))
         assert (not path or
-                (len(path) > 1 and obj not in qApp.topLevelWidgets()) or
-                (len(path) == 1 and obj in qApp.topLevelWidgets()))
+                len(path) > 1 or
+                len(path) == 1 and obj in qApp.topLevelWidgets())
         if path:
             path = tuple(reversed(path))
             log.info('Serialized object path: %s', path)
@@ -508,78 +533,28 @@ class Resolver:
                             target.name)
 
         # If target widget doesn't have a name, find it in the tree
-        def candidates(path, i, widgets):
+        def candidates(i, widgets):
             # TODO: make this function nicer
-            if i == len(path) - 1:
-                return iter((nth(path[i].index,
-                                 (w for w in widgets
-                                  if type(w) == cls.deserialize_type(path[i].type))),
-                             ))
             target = path[i]
             target_type = cls.deserialize_type(target.type)
-            return candidates(path, i + 1,
+            if i == len(path) - 1:
+                # This is the last element in the path, the true target
+                return iter((nth(target.index,
+                                 (w for w in widgets if type(w) == target_type)),))
+            return candidates(i + 1,
                               cls._get_children(nth(target.index,
                                                     (w for w in widgets
                                                      if type(w) == target_type))))
 
-        target_with_name = next((i for i in reversed(path) if i.name), None)
-        if target_with_name:
-            i = path.index(target_with_name)
-            try:
-                return next(candidates(path, i,
-                                       (cls._find_by_name(target_with_name),)))
-            except StopIteration:
-                pass
+        # target_with_name = next((i for i in reversed(path) if i.name), None)
+        # if target_with_name:
+        #     i = path.index(target_with_name)
+        #     try:
+        #         return next(candidates(i, (cls._find_by_name(target_with_name),)))
+        #     except StopIteration:
+        #         pass
 
-        widgets = qApp.topLevelWidgets()
-        return next(candidates(path, 0, widgets), None)
-
-
-
-
-        # FIXME: The logic here may need rework
-
-        def filtertype(target_type, iterable):
-            return [i for i in iterable if type(i) == target_type]
-
-        def get_candidates(widget, i):
-            if not (type(widget) == path[i].type and
-                    (not path[i].name or path[i].name == widget.objectName())):
-                return
-
-            if i == len(path) - 1:
-                return widget
-
-            # If fuzzy matching, all the children widgets are considered;
-            # otherwise just the one in the correct position
-            children = widget.children()
-            if not cls.FUZZY_MATCHING:
-                target = path[i + 1]
-                try:
-                    children = (filtertype(target_type, children)[target.index],)
-                except IndexError:
-                    # Insufficient children of correct type
-                    return
-
-            for child in children:
-                obj = get_candidates(child, i + 1)
-                if obj:
-                    return obj
-
-        target = path[0]
-        widgets = qApp.topLevelWidgets()
-        if not cls.FUZZY_MATCHING:
-            try:
-                widgets = (filtertype(target_type, widgets)[target.index],)
-            except IndexError:
-                return
-        for window in widgets:
-            obj = get_candidates(window, 0)
-            if obj:
-                return obj
-
-        # No suitable object found
-        return None
+        return next(candidates(0, qApp.topLevelWidgets()), None)
 
     @classmethod
     def getstate(cls, obj, event):
@@ -601,6 +576,8 @@ class Resolver:
                       event_str, obj_path)
             REAL_EXIT(3)
         event = cls.deserialize_event(event_str)
+        log.info('Replaying event %s on object %s',
+                 event_str, obj_path)
         return qApp.sendEvent(obj, event)
 
     @classmethod
@@ -690,7 +667,7 @@ class EventReplayer(_EventFilter):
     def __init__(self):
         super().__init__()
         # Replay events X ms after the last event
-        self.timer = QtCore.QTimer(self, interval=1000)
+        self.timer = QtCore.QTimer(self, interval=50)
         self.timer.timeout.connect(self.replay_next_event)
 
     def load(self, file):
