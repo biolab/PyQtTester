@@ -788,6 +788,11 @@ def main():
     # Patch QApplication to filter all events through EventRecorder / EventReplayer
     class QApplication(QtGui.QApplication):
         def __init__(self, *args, **kwargs):
+            # Before constructing the application, prevent the application of
+            # any custom, desktop environment-dependent styles and settings.
+            # We can only reproduce scenarios if everyone is running them
+            # the same.
+            QApplication.setDesktopSettingsAware(False)
             super().__init__(*args, **kwargs)
             for event_filter in event_filters:
                 log.debug('Installing event filter: %s',
