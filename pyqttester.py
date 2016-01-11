@@ -470,13 +470,6 @@ class Resolver:
         return chain.from_iterable(parts)
 
     @classmethod
-    def _get_attr_children(cls, widget):
-        assert False, 'Should probably not be here'
-        return {attr: getattr(widget, attr)
-                for attr in dir(widget)
-                if not (attr.startswith('__') and attr.endswith('__'))}
-
-    @classmethod
     def serialize_object(cls, obj):
         assert isinstance(obj, QWidget)
 
