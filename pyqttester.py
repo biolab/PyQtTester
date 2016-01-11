@@ -639,11 +639,22 @@ class EventRecorder(_EventFilter):
         is_skipped = (not self.event_matches(type(event).__name__) or
                       not isinstance(obj, QWidget))  # FIXME: This condition is too strict (QGraphicsItems are QOjects)
         log_ = log.debug if is_skipped else log.info
-        log_('Caught %s%s %s event: %s',
-             'spontaneous ' if event.spontaneous() else '',
+        log.info('Caught %s%s %s event (%s) on object %s',
              'skipped' if is_skipped else 'recorded',
+             ' spontaneous' if event.spontaneous() else '',
              EVENT_TYPE.get(event.type(), 'Unknown(type=' + str(event.type()) + ')'),
-             type(event))
+             event.__class__.__name__, obj)
+        # Before any event on any widget, make sure the window of that window
+        # is active and in raised (in front). This is required for replaying
+        # without a window manager.
+        # if isinstance(obj, QWidget) and not obj.isActiveWindow():
+        #     obj.activateWindow()
+
+        if (isinstance(obj, QWidget) and
+                not is_skipped and
+                not obj.isActiveWindow() and
+                event.spontaneous()):
+            obj.activateWindow()
         if not is_skipped:
             serialized = Resolver.getstate(obj, event)
             if serialized:
