@@ -824,6 +824,11 @@ def main():
     if args.record:
         recorder.dump(args.record)
 
+    have_more_events = args.replay and list(replayer.events)
+    if have_more_events:
+        log.warning("Application didn't manage to replay all events. "
+                    "This may indicate failure. :|")
+        log.info("The remaining events are: %s", have_more_events)
     return 0
 
 if __name__ == '__main__':
