@@ -3,6 +3,7 @@
 import sys; REAL_EXIT = sys.exit
 import os
 import re
+import signal
 import subprocess
 from functools import reduce, wraps
 from collections import namedtuple
@@ -12,8 +13,6 @@ from importlib import import_module
 try: import cPickle as pickle
 except ImportError: import pickle
 
-# Allow termination with Ctrl+C
-import signal; signal.signal(signal.SIGINT, signal.SIG_DFL)
 
 try: from functools import lru_cache
 except ImportError:  # Py2
@@ -298,7 +297,6 @@ PathElement = namedtuple('PathElement', ('index', 'type', 'name'))
 
 
 class Resolver:
-    FUZZY_MATCHING = False
 
     class IdentityMapper:
         def __getitem__(self, key):
@@ -648,9 +646,7 @@ class Resolver:
         print()
 
 
-
 class _EventFilter:
-
     @staticmethod
     def wait_for_app_start(method):
         is_started = False
@@ -658,11 +654,10 @@ class _EventFilter:
         def f(self, obj, event):
             nonlocal is_started
             if not is_started:
-                log.debug(
-                    'Caught %s (%s) event but app not yet fully "started"',
-                    EVENT_TYPE.get(event.type(),
-                                   'QEvent(type=' + str(event.type()) + ')'),
-                    type(event).__name__)
+                log.debug('Caught %s (%s) event but app not yet fully "started"',
+                          EVENT_TYPE.get(event.type(),
+                                         'QEvent(type=' + str(event.type()) + ')'),
+                          type(event).__name__)
                 if event.type() == QtCore.QEvent.ActivationChange:
                     log.debug("Ok, app is started now, don't worry")
                     is_started = True
@@ -675,10 +670,14 @@ class _EventFilter:
             return method(self, obj, event) if is_started else False
         return f
 
+    def close(self):
+        pass
+
 
 class EventRecorder(_EventFilter):
-    def __init__(self, events_include, events_exclude):
+    def __init__(self, file, events_include, events_exclude):
         super().__init__()
+        self.file = file
 
         # Prepare the recorded events stack;
         # the first entry is the protocol version
@@ -688,8 +687,10 @@ class EventRecorder(_EventFilter):
 
         self.resolver = Resolver(obj_cache)
 
-        is_included = re.compile('|'.join(events_include.split(','))).search
-        is_excluded = re.compile('|'.join(events_exclude.split(','))).search
+        is_included = (re.compile('|'.join(events_include.split(','))).search
+                       if events_include else lambda _: True)
+        is_excluded = (re.compile('|'.join(events_exclude.split(','))).search
+                       if events_exclude else lambda _: False)
 
         def event_matches(event_name):
             return is_included(event_name) and not is_excluded(event_name)
@@ -705,10 +706,11 @@ class EventRecorder(_EventFilter):
                       not isinstance(obj, QWidget))  # FIXME: This condition is too strict (QGraphicsItems are QOjects)
         log_ = log.debug if is_skipped else log.info
         log.info('Caught %s%s %s event (%s) on object %s',
-             'skipped' if is_skipped else 'recorded',
-             ' spontaneous' if event.spontaneous() else '',
-             EVENT_TYPE.get(event.type(), 'Unknown(type=' + str(event.type()) + ')'),
-             event.__class__.__name__, obj)
+                 'skipped' if is_skipped else 'recorded',
+                 ' spontaneous' if event.spontaneous() else '',
+                 EVENT_TYPE.get(event.type(),
+                                'Unknown(type=' + str(event.type()) + ')'),
+                 event.__class__.__name__, obj)
         # Before any event on any widget, make sure the window of that window
         # is active and raised (in front). This is required for replaying
         # without a window manager.
@@ -723,12 +725,13 @@ class EventRecorder(_EventFilter):
                 self.events.append(serialized)
         return False
 
-    def dump(self, file):
+    def close(self):
+        """Write out the scenario"""
         log.debug('Writing scenario file')
-        pickle.dump(self.events, file, protocol=0)
+        pickle.dump(self.events, self.file, protocol=0)
         log.info("Scenario of %d events written into '%s'",
-                 len(self.events) - SCENARIO_FORMAT_VERSION - 1, file.name)
-        log.info(self.events)
+                 len(self.events) - SCENARIO_FORMAT_VERSION - 1, self.file.name)
+        log.debug(self.events)
 
 
 class EventReplayer(_EventFilter):
@@ -771,6 +774,13 @@ class EventReplayer(_EventFilter):
         log.debug('Replaying event: %s', event)
         self.resolver.setstate(*event)
         return False
+
+    def close(self):
+        remaining_events = list(self.events)
+        if remaining_events:
+            log.warning("Application didn't manage to replay all events. "
+                        "This may indicate failure. But not necessarily. :|")
+            log.info("The remaining events are: %s", remaining_events)
 
 
 class EventExplainer:
@@ -825,7 +835,6 @@ def main():
     EVENT_TYPE = {v: k
                   for k, v in QtCore.QEvent.__dict__.items()
                   if isinstance(v, int)}
-    Resolver.FUZZY_MATCHING = args.fuzzy
 
     # This is just a simple unit test. Put here because real Qt has only
     # been made available above.
@@ -840,13 +849,13 @@ def main():
     event_filters = []
     if args.record:
         recorder = EventFilter(EventRecorder,
-                               args.events_include or r'.',
-                               args.events_exclude or r'^$')
+                               args.record,
+                               args.events_include,
+                               args.events_exclude)
         event_filters.append(recorder)
     if args.replay:
         replayer = EventFilter(EventReplayer, args.replay)
         event_filters.append(replayer)
-    ...
 
     assert event_filters
 
@@ -869,6 +878,7 @@ def main():
     def exit(status=0):
         log.warning('Prevented call to sys.exit() with status: %s', str(status))
         if status != 0:
+            log.warning('But the exit status was non-zero, so quitting')
             REAL_EXIT(status)
     sys.exit = exit
 
@@ -880,20 +890,15 @@ def main():
         REAL_EXIT(2)
     sys.excepthook = excepthook
 
+    # Allow termination with Ctrl+C
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
     # Execute the app
     args.main()
 
     log.info('Application exited successfully. Congrats!')
 
-    # Write out the scenario
-    if args.record:
-        recorder.dump(args.record)
-
-    have_more_events = args.replay and list(replayer.events)
-    if have_more_events:
-        log.warning("Application didn't manage to replay all events. "
-                    "This may indicate failure. :|")
-        log.info("The remaining events are: %s", have_more_events)
+    for event_filter in event_filters:
+        event_filter.close()
     return 0
 
 if __name__ == '__main__':
