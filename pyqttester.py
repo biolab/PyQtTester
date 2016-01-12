@@ -6,7 +6,7 @@ import re
 import subprocess
 from functools import reduce, wraps
 from collections import namedtuple
-from itertools import chain, islice, count
+from itertools import chain, islice, count, repeat
 from importlib import import_module
 
 try: import cPickle as pickle
@@ -163,14 +163,15 @@ def parse_args():
 
     def is_command_available(command):
         try:
-            if 0 != subprocess.call(command, shell=True, stdout=subprocess.DEVNULL):
+            if 0 != subprocess.call(['which', command],
+                                    stdout=subprocess.DEVNULL):
                 raise OSError
         except OSError:
             return False
         return True
 
     if args.x11_video:
-        if not is_command_available('ffmpeg --help'):
+        if not is_command_available('ffmpeg'):
             error('Recording video of X11 session (--x11-video) requires working '
                   'ffmpeg. Install package ffmpeg.')
         if not args.replay:
@@ -184,8 +185,19 @@ def parse_args():
         if not args.replay:
             error('--x11 requires --replay')
         # Escalate the power of shell
-        if not is_command_available('xvfb-run --help'):
-            error('Headless X11 (--x11) requires working xvfb-run. Install package xvfb.')
+        for xvfb in ('Xvfb', '/usr/X11/bin/Xvfb'):
+            if is_command_available(xvfb):
+                break
+        else:
+            error('Headless X11 (--x11) requires working Xvfb. '
+                  'Install package xvfb (or XQuartz on a Macintosh).')
+        for xauth in ('xauth', '/usr/X11/bin/xauth'):
+            if is_command_available(xauth):
+                break
+        else:
+            error('Headless X11 (--x11) requires working xauth. '
+                  'Install package xauth (or XQuartz on a Macintosh).')
+
         log.info('Re-running head-less in Xvfb. '
                  # The following cannot be avoided because Xvfb writes all app's
                  # output, including stderr, to stdout
@@ -196,12 +208,48 @@ def parse_args():
             try: sys.argv.remove(arg)
             except ValueError: pass
 
+        from random import randint
         command_line = r'''
+
+# set -x  # Enable debugging
+set -e
+
+clean_up () {{
+    XAUTHORITY={AUTH_FILE} xauth remove :{DISPLAY} >/dev/null 2>&1
+    kill $(cat $XVFB_PID_FILE) >/dev/null 2>&1
+}}
+
+trap clean_up EXIT
+
 start_x11 () {{
-    xvfb-run --server-args '-fbdir /tmp -screen 0 {RESOLUTION}x16'  \
-             --auth-file {AUTH_FILE}  \
-             --server-num {DISPLAY}   \
-             sh -c '{ARGV}'
+    # Appropriated from xvfb-run
+
+    XAUTHORITY={AUTH_FILE} {XAUTH} add :{DISPLAY} . $(mcookie)
+
+    # Handle SIGUSR1 so Xvfb knows to send a signal when ready. I don't really
+    # understand how this was supposed to be handled by the code below, but
+    # xvfb-run did it like this so ...
+
+    trap : USR1
+    (trap '' USR1;
+     exec {XVFB} :{DISPLAY} -nolisten tcp  \
+                            -auth {AUTH_FILE}  \
+                            -fbdir /tmp -screen 0 {RESOLUTION}x16  \
+        >/dev/null 2>&1) &
+    XVFB_PID=$!
+    echo $XVFB_PID > $XVFB_PID_FILE
+    wait || :
+
+    if ! kill -0 $XVFB_PID 2>/dev/null; then
+        echo 'ERROR: Xvfb failed to start'
+        echo 1 > $RETVAL_FILE
+        return 1
+    fi
+
+    set +e
+    DISPLAY=:{DISPLAY} XAUTHORITY={AUTH_FILE} sh -c '{ARGV}'
+    echo $? > $RETVAL_FILE
+    set -e
 }}
 
 start_ffmpeg () {{
@@ -213,23 +261,32 @@ start_ffmpeg () {{
 
 kill_ffmpeg () {{
     [ "{VIDEO_FILE}" ] || return
-    FFMPEG_PID=$(cat $FFMPEG_PID_FILE)
-    kill -TERM $FFMPEG_PID
+    kill $(cat $FFMPEG_PID_FILE) 2>/dev/null
 }}
+
+# WTF: For some reason variables don't retain values across functions ???
+TMPDIR=${{TMPDIR:-/tmp/}}
+FFMPEG_PID_FILE=$(mktemp $TMPDIR/pyqttester.ffmpeg.XXXXXXX)
+XVFB_PID_FILE=$(mktemp $TMPDIR/pyqttester.xvfb.XXXXXXX)
+RETVAL_FILE=$(mktemp $TMPDIR/pyqttester.retval.XXXXXXX)
 
 # First start the Xvfb instance, replaying the scenario inside.
 # Right afterwards, start screengrabbing the Xvfb session with ffmpeg.
 # When the scenario completes, kill ffmpeg as well.
 
-FFMPEG_PID_FILE=$(mktemp)
 {{ start_x11; kill_ffmpeg; }} & start_ffmpeg ; wait
-rm $FFMPEG_PID_FILE
+
+RETVAL=$(cat $RETVAL_FILE)
+rm $FFMPEG_PID_FILE #RETVAL_FILE
+exit $RETVAL
 
 '''.format(VIDEO_FILE=args.x11_video,
            RESOLUTION='1280x1024',
            SCENARIO=args.replay.name,
            AUTH_FILE=os.path.join(os.path.expanduser('~'), '.Xauthority'),
-           DISPLAY=next(i for i in range(111, 1000)
+           XVFB=xvfb,
+           XAUTH=xauth,
+           DISPLAY=next(i for i in (randint(111, 10000) for _ in repeat(0))
                         if not os.path.exists('/tmp/.X{}-lock'.format(i))),
            ARGV=' '.join(sys.argv))
 
