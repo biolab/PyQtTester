@@ -46,10 +46,6 @@ def nth(n, iterable, default=None):
 
 
 def parse_args():
-    # WM must be compatible (probably click-to-focus, ...
-    # — I don't know, but most WMs I tried didn't work)
-    WINDOW_MANAGERS = ('windowlab',)
-
     from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
     argparser = ArgumentParser(
         description='A tool for testing PyQt GUI applications by recording '
@@ -96,9 +92,7 @@ def parse_args():
     argparser.add_argument(
         '--x11', action='store_true',
         help=('When replaying scenarios, do it in a new, headless X11 server. '
-              "This makes your app's stdout piped to stderr. "
-              "It will work better (or at all) if you make one of the following "
-              "window managers available: " + ', '.join(WINDOW_MANAGERS)) + '.')
+              "This makes your app's stdout piped to stderr."))
     argparser.add_argument(
         '--x11-video', metavar='FILE', nargs='?', const=True,
         help='Record the video of scenario playback into FILE (default: SCENARIO.mp4).')
@@ -207,9 +201,7 @@ start_x11 () {{
     xvfb-run --server-args '-fbdir /tmp -screen 0 {RESOLUTION}x16'  \
              --auth-file {AUTH_FILE}  \
              --server-num {DISPLAY}   \
-             sh -c '{WINDOW_MANAGERS}
-                    sleep .5;
-                    {ARGV}'
+             sh -c '{ARGV}'
 }}
 
 start_ffmpeg () {{
@@ -239,8 +231,6 @@ rm $FFMPEG_PID_FILE
            AUTH_FILE=os.path.join(os.path.expanduser('~'), '.Xauthority'),
            DISPLAY=next(i for i in range(111, 1000)
                         if not os.path.exists('/tmp/.X{}-lock'.format(i))),
-           WINDOW_MANAGERS=' '.join('{} 2>/dev/null &'.format(wm)
-                                    for wm in WINDOW_MANAGERS),
            ARGV=' '.join(sys.argv))
 
         REAL_EXIT(subprocess.call(command_line, shell=True, stdout=sys.stderr))
@@ -663,11 +653,8 @@ class EventRecorder(_EventFilter):
              EVENT_TYPE.get(event.type(), 'Unknown(type=' + str(event.type()) + ')'),
              event.__class__.__name__, obj)
         # Before any event on any widget, make sure the window of that window
-        # is active and in raised (in front). This is required for replaying
+        # is active and raised (in front). This is required for replaying
         # without a window manager.
-        # if isinstance(obj, QWidget) and not obj.isActiveWindow():
-        #     obj.activateWindow()
-
         if (isinstance(obj, QWidget) and
                 not is_skipped and
                 not obj.isActiveWindow() and
