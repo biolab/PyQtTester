@@ -6,7 +6,7 @@ import re
 import subprocess
 from functools import reduce, wraps
 from collections import namedtuple
-from itertools import chain, islice
+from itertools import chain, islice, count
 from importlib import import_module
 
 try: import cPickle as pickle
@@ -32,7 +32,7 @@ except ImportError:  # Py2
 
 __version__ = '0.1.0'
 
-SCENARIO_VERSION = 1
+SCENARIO_FORMAT_VERSION = 1
 
 
 def deepgetattr(obj, attr):
@@ -252,6 +252,15 @@ PathElement = namedtuple('PathElement', ('index', 'type', 'name'))
 
 class Resolver:
     FUZZY_MATCHING = False
+
+    class IdentityMapper:
+        def __getitem__(self, key):
+            return key
+
+    def __init__(self, obj_cache):
+        self.id_obj_map = obj_cache if obj_cache is not None else self.IdentityMapper()
+        self.obj_id_map = {}
+        self.autoinc = count(1)
 
     @staticmethod
     def _qenum_key(base, value, klass=None):
@@ -551,32 +560,37 @@ class Resolver:
 
         return next(candidates(0, qApp.topLevelWidgets()), None)
 
-    @classmethod
-    def getstate(cls, obj, event):
+    def getstate(self, obj, event):
         """Return picklable state of the object and its event"""
-        obj_path = cls.serialize_object(obj)
+        obj_path = self.serialize_object(obj)
         if not obj_path:
             log.warning('Skipping object: %s', obj)
             return None
-        event_str = cls.serialize_event(event)
+        event_str = self.serialize_event(event)
         if not event_str:
             log.warning('Skipping event: %s', event)
-        return (obj_path, event_str)
 
-    @classmethod
-    def setstate(cls, obj_path, event_str):
-        obj = cls.deserialize_object(obj_path)
+        obj_id = self.obj_id_map.get(obj_path)
+        if obj_id is None:
+            obj_id = next(self.autoinc)
+            self.obj_id_map[obj_path] = obj_id
+            self.id_obj_map[obj_id] = obj_path
+        return (obj_id, event_str)
+
+    def setstate(self, obj_id, event_str):
+        obj_path = self.id_obj_map[obj_id]
+        obj = self.deserialize_object(obj_path)
         if obj is None:
             log.error("Can't replay event %s on object %s: Object not found",
                       event_str, obj_path)
             REAL_EXIT(3)
-        event = cls.deserialize_event(event_str)
+        event = self.deserialize_event(event_str)
         log.info('Replaying event %s on object %s',
                  event_str, obj_path)
         return qApp.sendEvent(obj, event)
 
-    @classmethod
-    def print_state(cls, i, obj_path, event_str):
+    def print_state(self, i, obj_id, event_str):
+        obj_path = self.id_obj_map[obj_id]
         print('Event', str(i) + ':', event_str.replace('QtCore.', ''))
         print('Object:')
         for indent, el in enumerate(obj_path):
@@ -621,7 +635,11 @@ class EventRecorder(_EventFilter):
 
         # Prepare the recorded events stack;
         # the first entry is the protocol version
-        self.events = [SCENARIO_VERSION]
+        self.events = [SCENARIO_FORMAT_VERSION]
+        obj_cache = {}
+        self.events.append(obj_cache)
+
+        self.resolver = Resolver(obj_cache)
 
         is_included = re.compile('|'.join(events_include.split(','))).search
         is_excluded = re.compile('|'.join(events_exclude.split(','))).search
@@ -656,7 +674,7 @@ class EventRecorder(_EventFilter):
                 event.spontaneous()):
             obj.activateWindow()
         if not is_skipped:
-            serialized = Resolver.getstate(obj, event)
+            serialized = self.resolver.getstate(obj, event)
             if serialized:
                 self.events.append(serialized)
         return False
@@ -665,21 +683,24 @@ class EventRecorder(_EventFilter):
         log.debug('Writing scenario file')
         pickle.dump(self.events, file, protocol=0)
         log.info("Scenario of %d events written into '%s'",
-                 len(self.events) - SCENARIO_VERSION, file.name)
+                 len(self.events) - SCENARIO_FORMAT_VERSION - 1, file.name)
         log.info(self.events)
 
 
 class EventReplayer(_EventFilter):
-    def __init__(self):
+    def __init__(self, file):
         super().__init__()
         # Replay events X ms after the last event
         self.timer = QtCore.QTimer(self, interval=50)
         self.timer.timeout.connect(self.replay_next_event)
+        self.load(file)
 
     def load(self, file):
         self._events = pickle.load(file)
         self.events = iter(self._events)
-        self.format_version = next(self.events)
+        format_version = next(self.events)
+        obj_cache = next(self.events) if format_version > 0 else None
+        self.resolver = Resolver(obj_cache)
 
     @_EventFilter.wait_for_app_start
     def eventFilter(self, obj, event):
@@ -704,19 +725,21 @@ class EventReplayer(_EventFilter):
             QtGui.qApp.quit()
             return
         log.debug('Replaying event: %s', event)
-        Resolver.setstate(*event)
+        self.resolver.setstate(*event)
         return False
 
 
 class EventExplainer:
-    def load(self, file):
+    def __init__(self, file):
         self._events = pickle.load(file)
         self.events = iter(self._events)
-        self.format_version = next(self.events)
+        format_version = next(self.events)
+        obj_cache = next(self.events) if format_version > 0 else None
+        self.resolver = Resolver(obj_cache)
 
     def run(self):
         for i, event in enumerate(self.events):
-            Resolver.print_state(i, *event)
+            self.resolver.print_state(i, *event)
 
 
 def EventFilter(type, *args):
@@ -766,8 +789,7 @@ def main():
            Resolver._qflags_key(Qt, Qt.LeftButton|Qt.RightButton)
 
     if args.info:
-        explainer = EventExplainer()
-        explainer.load(args.info)
+        explainer = EventExplainer(args.info)
         explainer.run()
         return 0
 
@@ -778,8 +800,7 @@ def main():
                                args.events_exclude or r'^$')
         event_filters.append(recorder)
     if args.replay:
-        replayer = EventFilter(EventReplayer)
-        replayer.load(args.replay)
+        replayer = EventFilter(EventReplayer, args.replay)
         event_filters.append(replayer)
     ...
 
