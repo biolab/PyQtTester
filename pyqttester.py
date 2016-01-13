@@ -44,171 +44,8 @@ def nth(n, iterable, default=None):
     return next(islice(iterable, n, None), default)
 
 
-def parse_args():
-    from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
-    argparser = ArgumentParser(
-        description='A tool for testing PyQt GUI applications by recording '
-                    'and replaying scenarios.',
-        formatter_class=ArgumentDefaultsHelpFormatter,
-    )
-    argparser.add_argument(
-        '--verbose', '-v', action='count',
-        help='Print verbose information (use twice for debug).')
-    argparser.add_argument(
-        '--qt', metavar='QT_VERSION', default='5', choices='45',
-        help='The version of PyQt to run the entry-point app with (4 or 5).')
-        # TODO: default try to figure out Qt version by grepping entry-point
-    group = argparser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        '--record', metavar='SCENARIO',
-        help='Record the events the user sends to the entry-point application '
-             'into the scenario file.')
-    group.add_argument(
-        '--replay', metavar='SCENARIO',
-        help='Replay the scenario.')
-    group.add_argument(
-        '--info', metavar='SCENARIO',
-        help='Explain in semi-human-readable form events the scenario contains.')
-    argparser.add_argument(
-        '--main', '-m', metavar='MODULE_PATH',
-        help='The application entry point (module.path.to:main function).')
-    argparser.add_argument(
-        '--events-include', metavar='FILTER',
-        default=r'MouseEvent,KeyEvent', # 'Drag,Focus,Hover'
-        help='When recording, record only events that match the (regex) filters.')
-    argparser.add_argument(
-        '--events-exclude', metavar='FILTER',
-        help="When recording, skip events that match the (regex) filters.")
-    argparser.add_argument( # TODO
-        '--objects-include', metavar='FILTER',
-        help='When recording, record only events on objects that match the (regex) filters.')
-    argparser.add_argument( # TODO
-        '--objects-exclude', metavar='FILTER',
-        help="When recording, skip events on objects that match the (regex) filter.")
-    argparser.add_argument( # TODO
-        '--fuzzy', action='store_true',
-        help='Fuzzy-matching of event target objects.')
-    argparser.add_argument(
-        '--x11', action='store_true',
-        help=('When replaying scenarios, do it in a new, headless X11 server. '
-              "This makes your app's stdout piped to stderr."))
-    argparser.add_argument(
-        '--x11-video', metavar='FILE', nargs='?', const=True,
-        help='Record the video of scenario playback into FILE (default: SCENARIO.mp4).')
-    argparser.add_argument( # TODO
-        '--coverage', action='store_true',
-        help='Run the coverage analysis simultaneously.')
-    argparser.add_argument(
-        '--log', metavar='FILE',
-        help='Save the program output into file.')
-    args = argparser.parse_args()
-
-    def init_logging(verbose=0, log_file=None):
-        import logging
-        global log
-        log = logging.getLogger(__name__)
-        formatter = logging.Formatter('%(relativeCreated)d %(levelname)s: %(message)s')
-        for handler in (logging.StreamHandler(),
-                        log_file and logging.FileHandler(log_file, 'w', encoding='utf-8')):
-            if handler:
-                handler.setFormatter(formatter)
-                log.addHandler(handler)
-        log.setLevel(logging.WARNING - 10 * verbose)
-
-    init_logging(args.verbose or 0, args.log)
-    log.info('Program arguments: %s', args)
-
-    def error(*args, **kwargs):
-        log.error(*args, **kwargs)
-        REAL_EXIT(1)
-
-    if args.record or args.replay:
-        if not args.main:
-            error('--record/--replay requires --main ("module.path.to.main" function)')
-
-        def _main(entry_point=args.main):
-            # Make the application believe it was run unpatched
-            sys.argv = [entry_point]  # TODO is this ok??
-            try:
-                module, main = entry_point.split(':')
-                log.debug('Importing module %s ...', module)
-                module = import_module(module)
-                main = deepgetattr(module, main)
-                if not callable(main):
-                    raise ValueError
-            except ValueError:
-                error('--main must be like module.path.to:main function')
-            else:
-                log.info('Running %s', entry_point)
-                main()
-
-        args.main = _main
-    if args.record:
-        try: args.record = open(args.record, 'wb')
-        except Exception as e:
-            error('--record: %s', e)
-    if args.replay:
-        try: args.replay = open(args.replay, 'rb')
-        except Exception as e:
-            error('--replay: %s', e)
-    if args.info:
-        try: args.info = open(args.info, 'rb')
-        except Exception as e:
-            error('--info: %s', e)
-    if args.coverage:
-        # TODO: https://coverage.readthedocs.org/en/coverage-4.0.2/api.html#api
-        #       https://nose.readthedocs.org/en/latest/plugins/cover.html#source
-        ...
-
-    def is_command_available(command):
-        try:
-            if 0 != subprocess.call(['which', command],
-                                    stdout=subprocess.DEVNULL):
-                raise OSError
-        except OSError:
-            return False
-        return True
-
-    if args.x11_video:
-        if not is_command_available('ffmpeg'):
-            error('Recording video of X11 session (--x11-video) requires working '
-                  'ffmpeg. Install package ffmpeg.')
-        if not args.replay:
-            error('--x11-video requires --replay')
-        if not args.x11:
-            log.warning('--x11-video implies --x11')
-            args.x11 = True
-        if args.x11_video is True:
-            args.x11_video = args.replay.name + '.mp4'
-    if args.x11:
-        if not args.replay:
-            error('--x11 requires --replay')
-        # Escalate the power of shell
-        for xvfb in ('Xvfb', '/usr/X11/bin/Xvfb'):
-            if is_command_available(xvfb):
-                break
-        else:
-            error('Headless X11 (--x11) requires working Xvfb. '
-                  'Install package xvfb (or XQuartz on a Macintosh).')
-        for xauth in ('xauth', '/usr/X11/bin/xauth'):
-            if is_command_available(xauth):
-                break
-        else:
-            error('Headless X11 (--x11) requires working xauth. '
-                  'Install package xauth (or XQuartz on a Macintosh).')
-
-        log.info('Re-running head-less in Xvfb. '
-                 # The following cannot be avoided because Xvfb writes all app's
-                 # output, including stderr, to stdout
-                 'All subprocess output (including stdout) will be piped to stderr.')
-        # Prevent recursion
-        for arg in ('--x11',
-                    '--x11-video'):
-            try: sys.argv.remove(arg)
-            except ValueError: pass
-
-        from random import randint
-        command_line = r'''
+## This shell script is run if program is run with --x11 option
+SHELL_SCRIPT = r'''
 
 # set -x  # Enable debugging
 set -e
@@ -279,17 +116,217 @@ RETVAL=$(cat $RETVAL_FILE)
 rm $FFMPEG_PID_FILE #RETVAL_FILE
 exit $RETVAL
 
-'''.format(VIDEO_FILE=args.x11_video,
-           RESOLUTION='1280x1024',
-           SCENARIO=args.replay.name,
-           AUTH_FILE=os.path.join(os.path.expanduser('~'), '.Xauthority'),
-           XVFB=xvfb,
-           XAUTH=xauth,
-           DISPLAY=next(i for i in (randint(111, 10000) for _ in repeat(0))
-                        if not os.path.exists('/tmp/.X{}-lock'.format(i))),
-           ARGV=' '.join(sys.argv))
+'''
 
-        REAL_EXIT(subprocess.call(command_line, shell=True, stdout=sys.stderr))
+
+def parse_args():
+    from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
+    argparser = ArgumentParser(
+        description='A tool for testing PyQt GUI applications by recording '
+                    'and replaying scenarios.',
+        formatter_class=ArgumentDefaultsHelpFormatter,
+    )
+    argparser.add_argument(
+        '--verbose', '-v', action='count',
+        help='Print verbose information (use twice for debug).')
+    argparser.add_argument(
+        '--log', metavar='FILE',
+        help='Log program output.')
+
+    subparsers = argparser.add_subparsers(
+        title='Sub-commands', dest='_subcommand',
+        help='Use --help for additional sub-command arguments.')
+    parser_record = subparsers.add_parser(
+        'record',
+        help='Record the events the user sends to the entry-point application '
+             'into the scenario file.')
+    parser_replay = subparsers.add_parser(
+        'replay',
+        help='Replay the recorded scenario.')
+    parser_explain = subparsers.add_parser(
+        'explain',
+        help='Explain in semi-human-readable form the events scenario contains.')
+
+    # TODO: default try to figure out Qt version by grepping entry-point
+    args, kwargs = (
+        ('--qt',),
+        dict(metavar='QT_VERSION', default='5', choices='45',
+             help='The version of PyQt to run the entry-point app with (4 or 5).'))
+    parser_record.add_argument(*args, **kwargs)
+    parser_replay.add_argument(*args, **kwargs)
+
+    args, kwargs = (
+        ('scenario',),
+        dict(metavar='SCENARIO',
+             help='The scenario file.'))
+    parser_record.add_argument(*args, **kwargs)
+    parser_replay.add_argument(*args, **kwargs)
+    parser_explain.add_argument(*args, **kwargs)
+
+    args, kwargs = (
+        ('main',),
+        dict(metavar='MODULE_PATH',
+             help='The application entry point (module.path.to:main function).'))
+    parser_record.add_argument(*args, **kwargs)
+    parser_replay.add_argument(*args, **kwargs)
+
+    parser_record.add_argument(
+        '--events-include', metavar='REGEX',
+        default=r'MouseEvent,KeyEvent', # 'Drag,Focus,Hover'
+        help='When recording, record only events that match the filter.')
+    parser_record.add_argument(
+        '--events-exclude', metavar='REGEX',
+        help="When recording, skip events that match the filter.")
+    parser_record.add_argument( # TODO
+        '--objects-include', metavar='REGEX',
+        help='When recording, record only events on objects that match the filter.')
+    parser_record.add_argument( # TODO
+        '--objects-exclude', metavar='REGEX',
+        help="When recording, skip events on objects that match the filter.")
+
+    parser_replay.add_argument(
+        '--x11', action='store_true',
+        help=('When replaying scenarios, do it in a new, headless X11 server. '
+              "This makes your app's stdout piped to stderr."))
+    parser_replay.add_argument(
+        '--x11-video', metavar='FILE', nargs='?', const=True,
+        help='Record the video of scenario playback into FILE (default: SCENARIO.mp4).')
+    parser_replay.add_argument( # TODO
+        '--coverage', action='store_true',
+        help='Run the coverage analysis simultaneously.')
+
+    args = argparser.parse_args()
+
+    def init_logging(verbose=0, log_file=None):
+        import logging
+        global log
+        log = logging.getLogger(__name__)
+        formatter = logging.Formatter('%(relativeCreated)d %(levelname)s: %(message)s')
+        for handler in (logging.StreamHandler(),
+                        log_file and logging.FileHandler(log_file, 'w', encoding='utf-8')):
+            if handler:
+                handler.setFormatter(formatter)
+                log.addHandler(handler)
+        log.setLevel(logging.WARNING - 10 * verbose)
+
+    init_logging(args.verbose or 0, args.log)
+    log.info('Program arguments: %s', args)
+
+    def _error(*args, **kwargs):
+        log.error(*args, **kwargs)
+        REAL_EXIT(1)
+
+    def _is_command_available(command):
+        try: return 0 == subprocess.call(['which', command], stdout=subprocess.DEVNULL)
+        except OSError: return False
+
+    def _check_main(args):
+
+        def _main(entry_point=args.main):
+            # Make the application believe it was run unpatched
+            sys.argv = [entry_point]  # TODO is this ok??
+            try:
+                module, main = entry_point.split(':')
+                log.debug('Importing module %s ...', module)
+                module = import_module(module)
+                main = deepgetattr(module, main)
+                if not callable(main):
+                    raise ValueError
+            except ValueError:
+                _error('--main must be like module.path.to:main function')
+            else:
+                log.info('Running %s', entry_point)
+                main()
+
+        args.main = _main
+
+    def _global_qt(args):
+        global QtGui, QtCore, QWidget, Qt, qApp, QT_KEYS, EVENT_TYPE
+        PyQt = 'PyQt' + str(args.qt)
+        QtGui = import_module(PyQt + '.QtGui')
+        QtCore = import_module(PyQt + '.QtCore')
+        Qt = QtCore.Qt
+        try:
+            QWidget = QtGui.QWidget
+            qApp = QtGui.qApp
+        except AttributeError:  # PyQt5
+            QtWidgets = import_module(PyQt + '.QtWidgets')
+            QWidget = QtWidgets.QWidget
+            qApp = QtWidgets.qApp
+        QT_KEYS = {value: 'Qt.' + key
+                   for key, value in Qt.__dict__.items()
+                   if key.startswith('Key_')}
+        EVENT_TYPE = {v: k
+                      for k, v in QtCore.QEvent.__dict__.items()
+                      if isinstance(v, int)}
+        # This is just a simple unit test. Put here because real Qt has only
+        # been made available above.
+        assert 'Qt.LeftButton|Qt.RightButton' == \
+               Resolver._qflags_key(Qt, Qt.LeftButton | Qt.RightButton)
+
+    def check_explain(args):
+        try: args.scenario = open(args.scenario, 'rb')
+        except (IOError, OSError) as e:
+            _error('explain %s: %s', args.scenario, e)
+
+    def check_record(args):
+        _check_main(args)
+        _global_qt(args)
+        try: args.scenario = open(args.scenario, 'wb')
+        except (IOError, OSError) as e:
+            _error('record %s: %s', args.scenario, e)
+
+    def check_replay(args):
+        _check_main(args)
+        _global_qt(args)
+        try: args.scenario = open(args.scenario, 'rb')
+        except (IOError, OSError) as e:
+            _error('replay %s: %s', args.scenario, e)
+        # TODO: https://coverage.readthedocs.org/en/coverage-4.0.2/api.html#api
+        #       https://nose.readthedocs.org/en/latest/plugins/cover.html#source
+        if args.x11_video:
+            if not _is_command_available('ffmpeg'):
+                _error('Recording video of X11 session (--x11-video) requires '
+                      'ffmpeg. Install package ffmpeg.')
+            if not args.x11:
+                log.warning('--x11-video implies --x11')
+                args.x11 = True
+            if args.x11_video is True:
+                args.x11_video = args.scenario.name + '.mp4'
+        if args.x11:
+            for xvfb in ('Xvfb', '/usr/X11/bin/Xvfb'):
+                if _is_command_available(xvfb):
+                    break
+            else: _error('Headless X11 (--x11) requires working Xvfb. '
+                        'Install package xvfb (or XQuartz on a Macintosh).')
+            for xauth in ('xauth', '/usr/X11/bin/xauth'):
+                if _is_command_available(xauth):
+                    break
+            else: _error('Headless X11 (--x11) requires working xauth. '
+                        'Install package xauth (or XQuartz on a Macintosh).')
+
+            log.info('Re-running head-less in Xvfb.')
+            # Prevent recursion
+            for arg in ('--x11', '--x11-video'):
+                try: sys.argv.remove(arg)
+                except ValueError: pass
+
+            from random import randint
+            command_line = SHELL_SCRIPT.format(
+                    VIDEO_FILE=args.x11_video,
+                    RESOLUTION='1280x1024',
+                    SCENARIO=args.scenario.name,
+                    AUTH_FILE=os.path.join(os.path.expanduser('~'), '.Xauthority'),
+                    XVFB=xvfb,
+                    XAUTH=xauth,
+                    DISPLAY=next(i for i in (randint(111, 10000) for _ in repeat(0))
+                                 if not os.path.exists('/tmp/.X{}-lock'.format(i))),
+                    ARGV=' '.join(sys.argv))
+            REAL_EXIT(subprocess.call(command_line, shell=True, stdout=sys.stderr))
+
+    dict(record=check_record,
+         replay=check_replay,
+         explain=check_explain)[args._subcommand](args)
     return args
 
 
@@ -816,45 +853,20 @@ def EventFilter(type, *args):
 def main():
     args = parse_args()
 
-    # Set some global variables
-    global QtGui, QtCore, QWidget, Qt, qApp, QT_KEYS, EVENT_TYPE
-    PyQt = 'PyQt' + str(args.qt)
-    QtGui = import_module(PyQt + '.QtGui')
-    QtCore = import_module(PyQt + '.QtCore')
-    Qt = QtCore.Qt
-    try:
-        QWidget = QtGui.QWidget
-        qApp = QtGui.qApp
-    except AttributeError:  # PyQt5
-        QtWidgets = import_module(PyQt + '.QtWidgets')
-        QWidget = QtWidgets.QWidget
-        qApp = QtWidgets.qApp
-    QT_KEYS = {value: 'Qt.' + key
-               for key, value in Qt.__dict__.items()
-               if key.startswith('Key_')}
-    EVENT_TYPE = {v: k
-                  for k, v in QtCore.QEvent.__dict__.items()
-                  if isinstance(v, int)}
-
-    # This is just a simple unit test. Put here because real Qt has only
-    # been made available above.
-    assert 'Qt.LeftButton|Qt.RightButton' == \
-           Resolver._qflags_key(Qt, Qt.LeftButton|Qt.RightButton)
-
-    if args.info:
-        explainer = EventExplainer(args.info)
+    if args._subcommand == 'explain':
+        explainer = EventExplainer(args.scenario)
         explainer.run()
         return 0
 
     event_filters = []
-    if args.record:
+    if args._subcommand == 'record':
         recorder = EventFilter(EventRecorder,
-                               args.record,
+                               args.scenario,
                                args.events_include,
                                args.events_exclude)
         event_filters.append(recorder)
-    if args.replay:
-        replayer = EventFilter(EventReplayer, args.replay)
+    if args._subcommand == 'replay':
+        replayer = EventFilter(EventReplayer, args.scenario)
         event_filters.append(replayer)
 
     assert event_filters
