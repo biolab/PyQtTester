@@ -180,7 +180,7 @@ def parse_args():
 
     parser_record.add_argument(
         '--events-include', metavar='REGEX',
-        default=r'MouseEvent,KeyEvent', # 'Drag,Focus,Hover'
+        default=r'MouseEvent,KeyEvent,CloseEvent',  # TODO: add Drag, Focus, Hover ?
         help='When recording, record only events that match the filter.')
     parser_record.add_argument(
         '--events-exclude', metavar='REGEX',
@@ -492,6 +492,7 @@ class Resolver:
         'QMouseEvent':'type pos globalPos button buttons modifiers'.split(),
         'QKeyEvent': 'type key modifiers text isAutoRepeat count'.split(),
         'QMoveEvent': 'pos oldPos'.split(),
+        'QCloseEvent': [],
     }
 
     @classmethod
