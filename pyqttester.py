@@ -170,6 +170,14 @@ def parse_args():
     parser_record.add_argument(*args, **kwargs)
     parser_replay.add_argument(*args, **kwargs)
 
+    args, kwargs = (
+        ('args',),
+        dict(metavar='ARGS',
+             nargs='*',
+             help='Additional arguments to pass to the app as sys.argv.'))
+    parser_record.add_argument(*args, **kwargs)
+    parser_replay.add_argument(*args, **kwargs)
+
     parser_record.add_argument(
         '--events-include', metavar='REGEX',
         default=r'MouseEvent,KeyEvent', # 'Drag,Focus,Hover'
@@ -224,7 +232,7 @@ def parse_args():
 
         def _main(entry_point=args.main):
             # Make the application believe it was run unpatched
-            sys.argv = [entry_point]  # TODO is this ok??
+            sys.argv = [entry_point] + args.args
             try:
                 module, main = entry_point.split(':')
                 log.debug('Importing module %s ...', module)
