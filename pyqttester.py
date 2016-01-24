@@ -60,7 +60,8 @@ trap clean_up EXIT
 start_x11 () {{
     # Appropriated from xvfb-run
 
-    XAUTHORITY={AUTH_FILE} {XAUTH} add :{DISPLAY} . $(mcookie)
+    touch {AUTH_FILE}
+    XAUTHORITY={AUTH_FILE} {XAUTH} add :{DISPLAY} . {MCOOKIE}
 
     # Handle SIGUSR1 so Xvfb knows to send a signal when ready. I don't really
     # understand how this was supposed to be handled by the code below, but
@@ -320,6 +321,7 @@ def parse_args():
                 except ValueError: pass
 
             from random import randint
+            from hashlib import md5
             command_line = SHELL_SCRIPT.format(
                     VIDEO_FILE=args.x11_video,
                     RESOLUTION='1280x1024',
@@ -327,6 +329,7 @@ def parse_args():
                     AUTH_FILE=os.path.join(os.path.expanduser('~'), '.Xauthority'),
                     XVFB=xvfb,
                     XAUTH=xauth,
+                    MCOOKIE=md5(os.urandom(30)).hexdigest(),
                     DISPLAY=next(i for i in (randint(111, 10000) for _ in repeat(0))
                                  if not os.path.exists('/tmp/.X{}-lock'.format(i))),
                     ARGV=' '.join(sys.argv))
