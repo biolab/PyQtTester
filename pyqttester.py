@@ -139,13 +139,16 @@ def parse_args():
         help='Use --help for additional sub-command arguments.')
     parser_record = subparsers.add_parser(
         'record',
+        formatter_class=ArgumentDefaultsHelpFormatter,
         help='Record the events the user sends to the entry-point application '
              'into the scenario file.')
     parser_replay = subparsers.add_parser(
         'replay',
+        formatter_class=ArgumentDefaultsHelpFormatter,
         help='Replay the recorded scenario.')
     parser_explain = subparsers.add_parser(
         'explain',
+        formatter_class=ArgumentDefaultsHelpFormatter,
         help='Explain in semi-human-readable form the events scenario contains.')
 
     # TODO: default try to figure out Qt version by grepping entry-point
@@ -242,7 +245,7 @@ def parse_args():
                 if not callable(main):
                     raise ValueError
             except ValueError:
-                _error('--main must be like module.path.to:main function')
+                _error('MODULE_PATH must be like module.path.to:main function')
             else:
                 log.info('Running %s', entry_point)
                 main()
@@ -296,7 +299,7 @@ def parse_args():
         if args.x11_video:
             if not _is_command_available('ffmpeg'):
                 _error('Recording video of X11 session (--x11-video) requires '
-                      'ffmpeg. Install package ffmpeg.')
+                       'ffmpeg. Install package ffmpeg.')
             if not args.x11:
                 log.warning('--x11-video implies --x11')
                 args.x11 = True
@@ -307,12 +310,12 @@ def parse_args():
                 if _is_command_available(xvfb):
                     break
             else: _error('Headless X11 (--x11) requires working Xvfb. '
-                        'Install package xvfb (or XQuartz on a Macintosh).')
+                         'Install package xvfb (or XQuartz on a Macintosh).')
             for xauth in ('xauth', '/usr/X11/bin/xauth'):
                 if _is_command_available(xauth):
                     break
             else: _error('Headless X11 (--x11) requires working xauth. '
-                        'Install package xauth (or XQuartz on a Macintosh).')
+                         'Install package xauth (or XQuartz on a Macintosh).')
 
             log.info('Re-running head-less in Xvfb.')
             # Prevent recursion
