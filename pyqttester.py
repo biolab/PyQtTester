@@ -338,9 +338,12 @@ def parse_args():
                     ARGV=' '.join(sys.argv))
             REAL_EXIT(subprocess.call(command_line, shell=True, stdout=sys.stderr))
 
-    dict(record=check_record,
-         replay=check_replay,
-         explain=check_explain)[args._subcommand](args)
+    try:
+        dict(record=check_record,
+             replay=check_replay,
+             explain=check_explain)[args._subcommand](args)
+    except KeyError:
+        return REAL_EXIT(argparser.format_help())
     return args
 
 
