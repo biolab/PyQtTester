@@ -78,5 +78,8 @@ positions.
 
 **Is there anything else I need to know?**
 
-If your `QObject` objects have their `objectName` set, make sure the
+The app doesn't catch _any_ events on the native widgets/dialogs like the
+file open dialog (`QFileDialog.getOpenFileName()`) and similar.
+
+Also, if your `QObject` objects have their `objectName` set, make sure the
 names are unique.
