@@ -759,7 +759,7 @@ class EventRecorder(_EventFilter):
         # is active and raised (in front). This is required for replaying
         # without a window manager.
         if (isinstance(obj, QWidget) and
-                event.type() != QtCore.QEvent.MouseMove and
+                event.type() == QtCore.QEvent.MouseButtonPress and
                 not is_skipped and
                 not obj.isActiveWindow() and
                 event.spontaneous()):
