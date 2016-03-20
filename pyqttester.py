@@ -32,6 +32,7 @@ except ImportError:  # Py2
 __version__ = '0.1.0'
 
 SCENARIO_FORMAT_VERSION = 1
+X11_SHELL_SCRIPT = open(join(dirname(__file__), 'x11_subprocess.sh')).read()
 
 
 def deepgetattr(obj, attr):
@@ -47,82 +48,6 @@ def nth(n, iterable, default=None):
 def typed_nth(n, target_type, iterable, default=None):
     """Return the n-th item of type from iterable"""
     return nth(n, (i for i in iterable if type(i) == target_type), default)
-
-
-## This shell script is run if program is run with --x11 option
-SHELL_SCRIPT = r'''
-
-# set -x  # Enable debugging
-set -e
-
-clean_up () {{
-    XAUTHORITY={AUTH_FILE} xauth remove :{DISPLAY} >/dev/null 2>&1
-    kill $(cat $XVFB_PID_FILE) >/dev/null 2>&1
-}}
-
-trap clean_up EXIT
-
-start_x11 () {{
-    # Appropriated from xvfb-run
-
-    touch {AUTH_FILE}
-    XAUTHORITY={AUTH_FILE} {XAUTH} add :{DISPLAY} . {MCOOKIE}
-
-    # Handle SIGUSR1 so Xvfb knows to send a signal when ready. I don't really
-    # understand how this was supposed to be handled by the code below, but
-    # xvfb-run did it like this so ...
-
-    trap : USR1
-    (trap '' USR1;
-     exec {XVFB} :{DISPLAY} -nolisten tcp  \
-                            -auth {AUTH_FILE}  \
-                            -fbdir /tmp -screen 0 {RESOLUTION}x16  \
-        >/dev/null 2>&1) &
-    XVFB_PID=$!
-    echo $XVFB_PID > $XVFB_PID_FILE
-    wait || :
-
-    if ! kill -0 $XVFB_PID 2>/dev/null; then
-        echo 'ERROR: Xvfb failed to start'
-        echo 1 > $RETVAL_FILE
-        return 1
-    fi
-
-    set +e
-    DISPLAY=:{DISPLAY} XAUTHORITY={AUTH_FILE} sh -c '{ARGV}'
-    echo $? > $RETVAL_FILE
-    set -e
-}}
-
-start_ffmpeg () {{
-    [ "{VIDEO_FILE}" ] || return
-    ffmpeg -y -nostats -hide_banner -loglevel fatal -r 25 \
-           -f x11grab -s {RESOLUTION} -i :{DISPLAY} {VIDEO_FILE} </dev/null &
-    echo $! > $FFMPEG_PID_FILE
-}}
-
-kill_ffmpeg () {{
-    [ "{VIDEO_FILE}" ] || return
-    kill $(cat $FFMPEG_PID_FILE) 2>/dev/null
-}}
-
-# WTF: For some reason variables don't retain values across functions ???
-TMPDIR=${{TMPDIR:-/tmp/}}
-FFMPEG_PID_FILE=$(mktemp $TMPDIR/pyqttester.ffmpeg.XXXXXXX)
-XVFB_PID_FILE=$(mktemp $TMPDIR/pyqttester.xvfb.XXXXXXX)
-RETVAL_FILE=$(mktemp $TMPDIR/pyqttester.retval.XXXXXXX)
-
-# First start the Xvfb instance, replaying the scenario inside.
-# Right afterwards, start screengrabbing the Xvfb session with ffmpeg.
-# When the scenario completes, kill ffmpeg as well.
-
-{{ start_x11; kill_ffmpeg; }} & start_ffmpeg ; wait
-
-RETVAL=$(cat $RETVAL_FILE)
-rm $FFMPEG_PID_FILE #RETVAL_FILE
-exit $RETVAL
-
-'''
 
 
 def parse_args():
@@ -330,18 +255,22 @@ def parse_args():
 
             from random import randint
             from hashlib import md5
-            command_line = SHELL_SCRIPT.format(
-                    VIDEO_FILE=args.x11_video,
-                    RESOLUTION='1280x1024',
-                    SCENARIO=args.scenario.name,
-                    AUTH_FILE=os.path.join(os.path.expanduser('~'), '.Xauthority'),
-                    XVFB=xvfb,
-                    XAUTH=xauth,
-                    MCOOKIE=md5(os.urandom(30)).hexdigest(),
-                    DISPLAY=next(i for i in (randint(111, 10000) for _ in repeat(0))
-                                 if not os.path.exists('/tmp/.X{}-lock'.format(i))),
-                    ARGV=' '.join(sys.argv))
-            REAL_EXIT(subprocess.call(command_line, shell=True, stdout=sys.stderr))
+            env = os.environ.copy()
+            env.update(
+                VIDEO_FILE=args.x11_video,
+                RESOLUTION='1280x1024',
+                SCENARIO=args.scenario.name,
+                AUTH_FILE=os.path.join(os.path.expanduser('~'), '.Xauthority'),
+                XVFB=xvfb,
+                XAUTH=xauth,
+                MCOOKIE=md5(os.urandom(30)).hexdigest(),
+                DISPLAY=next(i for i in (randint(111, 10000) for _ in repeat(0))
+                             if not os.path.exists('/tmp/.X{}-lock'.format(i))),
+                ARGV=' '.join(sys.argv))
+            REAL_EXIT(subprocess.call(X11_SHELL_SCRIPT,
+                                      shell=True,
+                                      stdout=sys.stderr,
+                                      env=env))
 
     try:
         dict(record=check_record,
