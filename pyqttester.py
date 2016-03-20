@@ -44,6 +44,11 @@ def nth(n, iterable, default=None):
     return next(islice(iterable, n, None), default)
 
 
+def typed_nth(n, target_type, iterable, default=None):
+    """Return the n-th item of type from iterable"""
+    return nth(n, (i for i in iterable if type(i) == target_type), default)
+
+
 ## This shell script is run if program is run with --x11 option
 SHELL_SCRIPT = r'''
 
@@ -533,11 +538,10 @@ class Resolver:
 
     @staticmethod
     def deserialize_event(event_str):
-        if event_str.startswith('QEvent('):   # Generic, unspecialized QEvent
-            event = eval('QtCore.' + event_str)  # FIXME: deprecate?
-        else:
-            event = eval('QtGui.' + event_str)
-        return event
+        try:
+            return eval('QtGui.' + event_str)
+        except AttributeError:
+            return eval('QtCore.' + event_str)
 
     @staticmethod
     @lru_cache()
@@ -560,23 +564,26 @@ class Resolver:
         layout, or if the widget splits them, or if they are QObject children
         of widget, or similar.
         """
-        if not widget:
-            return qApp.topLevelWidgets()
-
-        parts = []
+        if widget is None:
+            yield from qApp.topLevelWidgets()
 
         if isinstance(widget, QtGui.QSplitter):
-            parts.append(widget.widget(i) for i in range(widget.count()))
-            parts.append(widget.handle(i) for i in range(widget.count()))
+            yield from (widget.widget(i) for i in range(widget.count()))
+            yield from (widget.handle(i) for i in range(widget.count()))
 
-        layout = getattr(widget, 'layout', lambda: None)()
+        layout = hasattr(widget, 'layout') and widget.layout()
         if layout:
-            parts.append(layout.itemAt(i).widget()
-                         for i in range(layout.count()))
+            yield from (layout.itemAt(i).widget()
+                        for i in range(layout.count()))
 
-        parts.append(getattr(widget, 'children', lambda: ())())
+        if hasattr(widget, 'children'):
+            yield from widget.children()
 
-        return chain.from_iterable(parts)
+        # If widget can't be found in the hierarchy by Qt means,
+        # try Python object attributes
+        yield from (getattr(widget, attr)
+                    for attr in dir(widget)
+                    if not attr.startswith('__') and attr.endswith('__'))
 
     @classmethod
     def serialize_object(cls, obj):
@@ -584,18 +591,12 @@ class Resolver:
 
         path = []
         parent = obj
-        while parent:
+        while parent is not None:
             widget, parent = parent, parent.parentWidget()
             children = cls._get_children(parent)
             # This typed index is more resilient than simple layout.indexOf()
-            index = next((i for i, w in enumerate(w for w in children
-                                                  if type(w) == type(widget))
-                          if w is widget), None)
-            # If widget can't be found in the hierarchy by Qt means,
-            # try Python object attributes
-            if index is None:
-                children = cls._get_attr_children(parent)
-                index = next((k for k, v in children.items() if v is widget), None)
+            typed_widgets = (w for w in children if type(w) == type(widget))
+            index = next((i for i, w in enumerate(typed_widgets) if w is widget), None)
 
             if index is None:
                 # FIXME: What to do here instead?
@@ -637,28 +638,16 @@ class Resolver:
                             target.name)
 
         # If target widget doesn't have a name, find it in the tree
-        def candidates(i, widgets):
-            # TODO: make this function nicer
-            target = path[i]
-            target_type = cls.deserialize_type(target.type)
-            if i == len(path) - 1:
-                # This is the last element in the path, the true target
-                return iter((nth(target.index,
-                                 (w for w in widgets if type(w) == target_type)),))
-            return candidates(i + 1,
-                              cls._get_children(nth(target.index,
-                                                    (w for w in widgets
-                                                     if type(w) == target_type))))
+        def get_child(i, widgets):
+            element = path[i]
+            widget = typed_nth(element.index,
+                               cls.deserialize_type(element.type),
+                               widgets)
+            if element == target or widget is None:
+                return widget
+            return get_child(i + 1, cls._get_children(widget))
 
-        # target_with_name = next((i for i in reversed(path) if i.name), None)
-        # if target_with_name:
-        #     i = path.index(target_with_name)
-        #     try:
-        #         return next(candidates(i, (cls._find_by_name(target_with_name),)))
-        #     except StopIteration:
-        #         pass
-
-        return next(candidates(0, qApp.topLevelWidgets()), None)
+        return get_child(0, qApp.topLevelWidgets())
 
     def getstate(self, obj, event):
         """Return picklable state of the object and its event"""
